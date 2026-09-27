@@ -114,6 +114,35 @@ provider directly rather than through an agent, so it follows `VISION_MODEL`,
 falling back to `AGENT_MODEL`. `chapter_02/02` sets `temperature=0.0`, which
 reasoning-style models reject — set `AGENT_TEMPERATURE=1` if yours is one.
 
+#### Choosing `AGENT_MODEL`
+
+Providers usually serve many models, but only some can run every example. Two
+capabilities are required:
+
+- **Structured output.** 35 examples set `output_type`, which the SDK sends as
+  `response_format: json_schema` (see `Converter.convert_response_format` in
+  openai-agents). Models that reject it fail with `400`; models that ignore it
+  fail with `ModelBehaviorError: Invalid JSON when parsing model output`.
+- **Tool calling *alongside* structured output.** 8 examples use both. This one
+  fails quietly: the model never calls the tool but still returns well-formed
+  output, so the answer looks correct while being entirely invented.
+
+To check a candidate, run the example that uses both:
+
+```bash
+AGENT_MODEL=your-model python chapter_02/07_agent_with_tool.py
+```
+
+The tool returns `Wikipedia`, `Google` and `YouTube`. If the output names
+anything else — ArXiv, Google Scholar, or even the tool's own name — the tool
+was never called and the model should not be used.
+
+Measured against Tencent LKEAP on 2026-09-27: of the 28 models it served, 20
+failed structured output outright, 6 produced output while silently skipping the
+tool, and `kimi-k2.7-code` was the only one that passed both. Note that probing
+`/v1/chat/completions` with a simple flat schema is not a reliable test — some
+models pass that and still fail the nested schemas the book actually uses.
+
 ### 5. Run the Code
 
 To execute the sample code, navigate to the desired chapter and run the Python file. For example:
