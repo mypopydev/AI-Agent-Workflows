@@ -98,13 +98,16 @@ def identify_model_name(model_id, api_key=None):
             detail = detail.replace(api_key, "[REDACTED]")
         return "FAIL", detail.splitlines()[-1] if detail else "Probe failed"
 
-    name = format_output(result.stdout)[:200]
+    name = format_output(result.stdout)
+    if api_key:
+        name = name.replace(api_key, "[REDACTED]")
+    name = name[:200]
     return ("REPORTED", name) if name else ("EMPTY", "No name returned")
 
 
 def report_model_name(model_id):
     import agents_config  # noqa: F401
-    from agents import Agent, Runner
+    from agents import Agent, MultiProvider, RunConfig, Runner
 
     agent = Agent(
         name="Model Name Reporter",
@@ -116,7 +119,13 @@ def report_model_name(model_id):
             "other text."
         ),
     )
-    result = Runner.run_sync(agent, input="What exact model are you running?")
+    result = Runner.run_sync(
+        agent,
+        input="What exact model are you running?",
+        run_config=RunConfig(
+            model_provider=MultiProvider(unknown_prefix_mode="model_id")
+        ),
+    )
     print(result.final_output)
 
 

@@ -4,6 +4,7 @@ import sys
 import types
 import unittest
 from contextlib import redirect_stdout
+from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -77,13 +78,13 @@ spans multiple lines</think>
         subprocess_run.return_value = subprocess.CompletedProcess(
             args=[],
             returncode=0,
-            stdout="<think>guessing</think>\nModel X v2\n",
+            stdout="<think>guessing</think>\nModel X v2 secret\n",
             stderr="",
         )
 
         result = identify_model_name("model-x", "secret")
 
-        self.assertEqual(result, ("REPORTED", "Model X v2"))
+        self.assertEqual(result, ("REPORTED", "Model X v2 [REDACTED]"))
         self.assertEqual(subprocess_run.call_args.kwargs["timeout"], 60)
         self.assertEqual(
             subprocess_run.call_args.kwargs["env"]["AGENT_MODEL"], "model-x"
@@ -103,6 +104,10 @@ spans multiple lines</think>
                 return_value=types.SimpleNamespace(final_output="Model name")
             )
         )
+        agent_module.RunConfig = Mock(
+            side_effect=lambda **kwargs: SimpleNamespace(**kwargs)
+        )
+        agent_module.MultiProvider = Mock()
         config_module = types.ModuleType("agents_config")
         config_module.model = lambda model_id: model_id
         stdout = io.StringIO()
@@ -111,10 +116,19 @@ spans multiple lines</think>
             sys.modules,
             {"agents": agent_module, "agents_config": config_module},
         ), redirect_stdout(stdout):
-            report_model_name("CaseSensitive-Model")
+            report_model_name("DeepSeek/deepseek-V4-Flash")
 
         self.assertEqual(
-            agent_module.Agent.call_args.kwargs["model"], "CaseSensitive-Model"
+            agent_module.Agent.call_args.kwargs["model"],
+            "DeepSeek/deepseek-V4-Flash",
+        )
+        self.assertEqual(
+            agent_module.MultiProvider.call_args.kwargs["unknown_prefix_mode"],
+            "model_id",
+        )
+        self.assertEqual(
+            agent_module.Runner.run_sync.call_args.kwargs["run_config"].model_provider,
+            agent_module.MultiProvider.return_value,
         )
 
     @patch("batch_test_models.subprocess.run")
