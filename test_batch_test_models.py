@@ -132,7 +132,8 @@ spans multiple lines</think>
         self.assertEqual(agent_module.Runner.run_sync.call_count, 2)
         self.assertEqual(
             agent_module.Runner.run_sync.call_args_list[0].kwargs["input"],
-            "What exact model are you running?",
+            "What exact model ID, name, and version are you running? "
+            "Do not guess; say if you cannot confirm.",
         )
         self.assertNotIn(
             "DeepSeek/deepseek-V4-Flash",

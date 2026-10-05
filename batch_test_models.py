@@ -122,7 +122,10 @@ def report_model_name(model_id):
     )
     self_report = Runner.run_sync(
         agent,
-        input="What exact model are you running?",
+        input=(
+            "What exact model ID, name, and version are you running? "
+            "Do not guess; say if you cannot confirm."
+        ),
         run_config=run_config,
     )
     id_check = Runner.run_sync(
