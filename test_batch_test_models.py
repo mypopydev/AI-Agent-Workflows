@@ -101,7 +101,10 @@ spans multiple lines</think>
         agent_module.Agent = Mock()
         agent_module.Runner = types.SimpleNamespace(
             run_sync=Mock(
-                return_value=types.SimpleNamespace(final_output="Model name")
+                side_effect=[
+                    types.SimpleNamespace(final_output="Model X v2"),
+                    types.SimpleNamespace(final_output="Yes, that matches."),
+                ]
             )
         )
         agent_module.RunConfig = Mock(
@@ -122,9 +125,26 @@ spans multiple lines</think>
             agent_module.Agent.call_args.kwargs["model"],
             "DeepSeek/deepseek-V4-Flash",
         )
-        self.assertIn(
+        self.assertNotIn(
             "DeepSeek/deepseek-V4-Flash",
             agent_module.Agent.call_args.kwargs["instructions"],
+        )
+        self.assertEqual(agent_module.Runner.run_sync.call_count, 2)
+        self.assertEqual(
+            agent_module.Runner.run_sync.call_args_list[0].kwargs["input"],
+            "What exact model are you running?",
+        )
+        self.assertNotIn(
+            "DeepSeek/deepseek-V4-Flash",
+            agent_module.Runner.run_sync.call_args_list[0].kwargs["input"],
+        )
+        self.assertIn(
+            "DeepSeek/deepseek-V4-Flash",
+            agent_module.Runner.run_sync.call_args_list[1].kwargs["input"],
+        )
+        self.assertIn("Self-report: Model X v2", stdout.getvalue())
+        self.assertIn(
+            "Configured ID check: Yes, that matches.", stdout.getvalue()
         )
         self.assertEqual(
             agent_module.MultiProvider.call_args.kwargs["unknown_prefix_mode"],

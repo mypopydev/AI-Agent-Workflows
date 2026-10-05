@@ -113,21 +113,28 @@ def report_model_name(model_id):
         name="Model Name Reporter",
         model=agents_config.model(model_id),
         instructions=(
-            f"The configured model ID for this request is {model_id}. "
-            "Report the exact model identifier, name, and version you can confirm "
-            "you are running. Do not infer or guess. If you cannot confirm the "
-            "exact identity, reply with the configured model ID provided above. "
-            "Reply with no other text."
+            "Answer based only on what you can confirm about the model serving this "
+            "request. Do not infer or guess. If you cannot confirm, say so."
         ),
     )
-    result = Runner.run_sync(
+    run_config = RunConfig(
+        model_provider=MultiProvider(unknown_prefix_mode="model_id")
+    )
+    self_report = Runner.run_sync(
         agent,
         input="What exact model are you running?",
-        run_config=RunConfig(
-            model_provider=MultiProvider(unknown_prefix_mode="model_id")
-        ),
+        run_config=run_config,
     )
-    print(result.final_output)
+    id_check = Runner.run_sync(
+        agent,
+        input=(
+            f"The configured model ID is {model_id}. Does it exactly match the "
+            "model serving this request? Reply Yes, No, or Unable to confirm."
+        ),
+        run_config=run_config,
+    )
+    print(f"Self-report: {self_report.final_output}")
+    print(f"Configured ID check: {id_check.final_output}")
 
 
 def fetch_models(base_url, api_key):
