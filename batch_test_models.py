@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -30,6 +31,11 @@ def filter_available_models(catalog):
     )
 
 
+def format_output(output):
+    output = re.sub(r"<think>.*?</think>", " ", output, flags=re.IGNORECASE | re.DOTALL)
+    return " ".join(output.split())
+
+
 def run_model(model_id, api_key=None):
     env = os.environ.copy()
     env["AGENT_MODEL"] = model_id
@@ -46,7 +52,7 @@ def run_model(model_id, api_key=None):
         return "TIMEOUT", f"Exceeded {TIMEOUT_SECONDS} seconds"
 
     if result.returncode == 0:
-        return "PASS", result.stdout.strip()
+        return "PASS", format_output(result.stdout)
 
     detail = (result.stderr or result.stdout).strip()
     if api_key:

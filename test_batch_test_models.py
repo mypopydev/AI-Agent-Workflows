@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 from dotenv import dotenv_values
 
-from batch_test_models import filter_available_models, run_model
+from batch_test_models import filter_available_models, format_output, run_model
 
 
 class FilterAvailableModelsTests(unittest.TestCase):
@@ -37,6 +37,19 @@ class FilterAvailableModelsTests(unittest.TestCase):
         config = dotenv_values(config_path)
 
         self.assertEqual(config["BATCH_TEST_EXCLUDED_MODELS"], expected)
+
+    def test_format_output_flattens_lines_and_removes_multiline_think_blocks(self):
+        output = """Plan begins
+<think>internal reasoning
+spans multiple lines</think>
+1. Define agents
+
+2. Explore architectures"""
+
+        self.assertEqual(
+            format_output(output),
+            "Plan begins 1. Define agents 2. Explore architectures",
+        )
 
     @patch("batch_test_models.subprocess.run")
     def test_model_run_uses_a_300_second_timeout(self, subprocess_run):
