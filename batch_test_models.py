@@ -113,10 +113,11 @@ def report_model_name(model_id):
         name="Model Name Reporter",
         model=agents_config.model(model_id),
         instructions=(
+            f"The configured model ID for this request is {model_id}. "
             "Report the exact model identifier, name, and version you can confirm "
             "you are running. Do not infer or guess. If you cannot confirm the "
-            "exact identity, reply exactly: Unable to confirm. Reply with no "
-            "other text."
+            "exact identity, reply with the configured model ID provided above. "
+            "Reply with no other text."
         ),
     )
     result = Runner.run_sync(

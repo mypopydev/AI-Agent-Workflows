@@ -122,6 +122,10 @@ spans multiple lines</think>
             agent_module.Agent.call_args.kwargs["model"],
             "DeepSeek/deepseek-V4-Flash",
         )
+        self.assertIn(
+            "DeepSeek/deepseek-V4-Flash",
+            agent_module.Agent.call_args.kwargs["instructions"],
+        )
         self.assertEqual(
             agent_module.MultiProvider.call_args.kwargs["unknown_prefix_mode"],
             "model_id",
