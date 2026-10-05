@@ -45,7 +45,8 @@ def format_output(output):
         for char in output
         if unicodedata.category(char) != "Cc" or char in "\r\n\t"
     )
-    return " ".join(output.split())
+    lines = (" ".join(line.split()) for line in output.splitlines() if line.strip())
+    return "\n".join(lines)
 
 
 def run_model(model_id, api_key=None):
@@ -101,7 +102,6 @@ def identify_model_name(model_id, api_key=None):
     name = format_output(result.stdout)
     if api_key:
         name = name.replace(api_key, "[REDACTED]")
-    name = name[:200]
     return ("REPORTED", name) if name else ("EMPTY", "No name returned")
 
 

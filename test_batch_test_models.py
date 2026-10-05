@@ -50,7 +50,7 @@ class FilterAvailableModelsTests(unittest.TestCase):
 
         self.assertEqual(config["BATCH_TEST_EXCLUDED_MODELS"], expected)
 
-    def test_format_output_flattens_lines_and_removes_multiline_think_blocks(self):
+    def test_format_output_preserves_numbered_lines_and_removes_multiline_think_blocks(self):
         output = """Plan begins
 <think>internal reasoning
 spans multiple lines</think>
@@ -60,7 +60,7 @@ spans multiple lines</think>
 
         self.assertEqual(
             format_output(output),
-            "Plan begins 1. Define agents 2. Explore architectures",
+            "Plan begins\n1. Define agents\n2. Explore architectures",
         )
 
     def test_format_output_removes_terminal_control_sequences(self):
@@ -89,6 +89,19 @@ spans multiple lines</think>
         self.assertEqual(
             subprocess_run.call_args.kwargs["env"]["AGENT_MODEL"], "model-x"
         )
+
+    @patch("batch_test_models.subprocess.run")
+    def test_model_name_probe_preserves_output_longer_than_200_characters(
+        self, subprocess_run
+    ):
+        output = "Self-report: " + "x" * 200 + "\nConfigured ID check: Yes"
+        subprocess_run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=output, stderr=""
+        )
+
+        result = identify_model_name("model-x")
+
+        self.assertEqual(result, ("REPORTED", output))
 
     @patch("batch_test_models.subprocess.run", side_effect=OSError("launch failed"))
     def test_model_name_probe_records_launch_failure(self, subprocess_run):
