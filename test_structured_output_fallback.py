@@ -12,13 +12,30 @@ The hook has two halves, and both are covered here:
 The second half patches a class attribute on the SDK, so every test restores
 the pristine factory in ``tearDown``; without that, one test's wrapper would
 leak into the rest of the suite.
+
+A third half covers the DeepSeek JSON Output request adaptation itself, at the
+HTTP level: an ``httpx2.MockTransport`` records the exact body the OpenAI client
+serializes, because ``extra_body`` precedence is an OpenAI SDK merge behaviour
+that only a real client proves.
 """
 
+import asyncio
 import importlib
+import json
 import os
 import sys
 import unittest
+from typing import Literal
 from unittest.mock import patch
+
+import httpx2
+from agents import Agent, Runner, function_tool, set_tracing_disabled
+from agents.agent_output import AgentOutputSchema
+from agents.exceptions import ModelBehaviorError
+from agents.model_settings import ModelSettings
+from agents.tracing import setup as tracing_setup
+from openai import AsyncOpenAI
+from pydantic import BaseModel
 
 import structured_output_fallback
 from agents.models.openai_chatcompletions import OpenAIChatCompletionsModel
@@ -310,6 +327,378 @@ class FallbackRegistrationTests(unittest.TestCase):
         self.assertNotIsInstance(
             model, structured_output_fallback.FallbackChatCompletionsModel
         )
+
+
+class ResearchStepModel(BaseModel):
+    title: str
+    estimated_minutes: int
+
+
+class ResearchPlanModel(BaseModel):
+    """A nested typed output: it exercises ``$defs``/``$ref`` and enums."""
+
+    topic: str
+    lead_step: ResearchStepModel
+    status: Literal["draft", "review", "final"]
+    risks: list[str]
+
+
+class RecursiveNodeModel(BaseModel):
+    """A typed output no finite JSON example can represent."""
+
+    child: "RecursiveNodeModel"
+
+
+RecursiveNodeModel.model_rebuild()
+
+
+class DeepSeekFallbackTests(unittest.TestCase):
+    """The DeepSeek JSON Output adaptation, checked on the serialized request.
+
+    Every test builds the adapter directly instead of going through
+    ``install``: what is under test is the request the adapter produces, not
+    how the adapter is selected.
+    """
+
+    def setUp(self) -> None:
+        self.requests: list[dict[str, object]] = []
+        self.reply = json.dumps(
+            {
+                "topic": "structured output",
+                "lead_step": {
+                    "title": "compare providers",
+                    "estimated_minutes": 30,
+                },
+                "status": "draft",
+                "risks": ["provider drift"],
+            }
+        )
+        self.finish_reason = "stop"
+        self._clients: list[AsyncOpenAI] = []
+
+        # Tracing defaults to a processor that exports to api.openai.com, so it
+        # is replaced by a disabled provider for the duration of each test.
+        self._previous_trace_provider = tracing_setup.GLOBAL_TRACE_PROVIDER
+        tracing_setup.GLOBAL_TRACE_PROVIDER = None
+        set_tracing_disabled(True)
+
+    def tearDown(self) -> None:
+        tracing_setup.GLOBAL_TRACE_PROVIDER = self._previous_trace_provider
+        asyncio.run(self._close_clients())
+
+    async def _close_clients(self) -> None:
+        for client in self._clients:
+            await client.close()
+
+    def _handle_request(self, request: httpx2.Request) -> httpx2.Response:
+        self.requests.append(json.loads(request.content))
+        return httpx2.Response(
+            200,
+            json={
+                "id": "chatcmpl-test",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "deepseek-chat",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": self.reply,
+                        },
+                        "finish_reason": self.finish_reason,
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 11,
+                    "completion_tokens": 7,
+                    "total_tokens": 18,
+                },
+            },
+        )
+
+    def _model(self, mode: str = "deepseek_json", max_tokens: int | None = 2048):
+        client = AsyncOpenAI(
+            api_key="test-key",
+            base_url=_BASE_URL,
+            http_client=httpx2.AsyncClient(
+                transport=httpx2.MockTransport(self._handle_request)
+            ),
+        )
+        self._clients.append(client)
+        return structured_output_fallback.FallbackChatCompletionsModel(
+            model="deepseek-chat",
+            openai_client=client,
+            mode=mode,
+            fallback_max_tokens=max_tokens,
+        )
+
+    def _run(
+        self,
+        *,
+        model=None,
+        output_type=ResearchPlanModel,
+        model_settings=None,
+        tools=None,
+    ):
+        kwargs = {}
+        if model_settings is not None:
+            kwargs["model_settings"] = model_settings
+        if tools is not None:
+            kwargs["tools"] = tools
+        agent = Agent(
+            name="planner",
+            instructions="Plan the research.",
+            model=model or self._model(),
+            output_type=output_type,
+            **kwargs,
+        )
+        return asyncio.run(Runner.run(agent, "Plan some research."))
+
+    def _one_request(self) -> dict[str, object]:
+        self.assertEqual(len(self.requests), 1, "expected exactly one request")
+        return self.requests[0]
+
+    # --- the serialized request -------------------------------------------
+
+    def test_request_asks_for_json_object_not_json_schema(self):
+        self._run()
+
+        self.assertEqual(
+            self._one_request()["response_format"], {"type": "json_object"}
+        )
+
+    def test_json_schema_response_format_is_not_sent(self):
+        self._run()
+
+        body = self._one_request()
+        self.assertNotIn("json_schema", body)
+        self.assertNotIn("json_schema", body["response_format"])
+
+    def test_system_instruction_carries_the_schema_and_an_example(self):
+        self._run()
+
+        system = self._one_request()["messages"][0]["content"]
+        schema = AgentOutputSchema(
+            ResearchPlanModel, strict_json_schema=True
+        ).json_schema()
+
+        # DeepSeek's JSON mode rejects a request whose prompt never says JSON.
+        self.assertIn("JSON", system)
+        self.assertIn(json.dumps(schema), system)
+        # The example is what the model copies; it must be the real shape.
+        self.assertIn(
+            json.dumps(
+                {
+                    "topic": "",
+                    "lead_step": {"title": "", "estimated_minutes": 0},
+                    "status": "draft",
+                    "risks": [""],
+                }
+            ),
+            system,
+        )
+
+    def test_unrelated_extra_body_entries_are_preserved(self):
+        self._run(
+            model_settings=ModelSettings(
+                extra_body={"thinking": {"type": "disabled"}}
+            )
+        )
+
+        body = self._one_request()
+        self.assertEqual(body["thinking"], {"type": "disabled"})
+        self.assertEqual(body["response_format"], {"type": "json_object"})
+
+    def test_typed_output_is_still_validated_by_the_original_schema(self):
+        result = self._run()
+
+        self.assertEqual(result.final_output.topic, "structured output")
+        self.assertEqual(result.final_output.status, "draft")
+        self.assertEqual(result.final_output.lead_step.estimated_minutes, 30)
+
+    def test_agent_instructions_are_kept_behind_the_formatting_ones(self):
+        self._run()
+
+        system = self._one_request()["messages"][0]["content"]
+        self.assertIn("Plan the research.", system)
+
+    # --- the token budget --------------------------------------------------
+
+    def test_agent_max_tokens_wins_over_the_fallback_budget(self):
+        self._run(
+            model=self._model(max_tokens=2048),
+            model_settings=ModelSettings(max_tokens=123),
+        )
+
+        self.assertEqual(self._one_request()["max_tokens"], 123)
+
+    def test_fallback_budget_is_applied_when_the_agent_sets_none(self):
+        self._run(model=self._model(max_tokens=2048))
+
+        self.assertEqual(self._one_request()["max_tokens"], 2048)
+
+    def test_missing_token_budget_fails_before_the_request(self):
+        with self.assertRaisesRegex(ValueError, "max_tokens"):
+            self._run(
+                model=self._model(max_tokens=None),
+                model_settings=ModelSettings(),
+            )
+
+        self.assertEqual(self.requests, [])
+
+    # --- provider output that is not the schema ----------------------------
+
+    def test_truncated_json_fails_visibly(self):
+        self.reply = '{"topic": "half'
+
+        with self.assertRaisesRegex(ModelBehaviorError, "Invalid JSON"):
+            self._run()
+
+    def test_empty_completion_fails_visibly(self):
+        self.reply = ""
+        self.finish_reason = "length"
+
+        with self.assertRaises(ModelBehaviorError):
+            self._run()
+
+    # --- requests the adaptation must leave alone --------------------------
+
+    def test_plain_text_agents_keep_the_native_request(self):
+        self.reply = "Here is the plan."
+        self._run(output_type=str, model=self._model())
+
+        self.assertNotIn("response_format", self._one_request())
+
+    def test_minimax_mode_still_delegates_to_the_sdk(self):
+        self._run(model=self._model(mode="minimax_function"))
+
+        self.assertEqual(
+            self._one_request()["response_format"]["type"], "json_schema"
+        )
+
+    def test_agents_with_tools_keep_the_native_request(self):
+        @function_tool
+        def lookup_library(name: str) -> str:
+            """Look a library up in the catalogue."""
+            return "found"
+
+        self._run(tools=[lookup_library])
+
+        body = self._one_request()
+        self.assertEqual(body["response_format"]["type"], "json_schema")
+        self.assertTrue(body["tools"])
+
+    def test_recursive_output_schema_fails_before_the_request(self):
+        with self.assertRaisesRegex(ValueError, "recursive"):
+            self._run(output_type=RecursiveNodeModel)
+
+        self.assertEqual(self.requests, [])
+
+    # --- the JSON example helper -------------------------------------------
+
+    def test_example_is_a_json_value_not_only_an_object(self):
+        for schema, expected in (
+            ({"type": "string"}, ""),
+            ({"type": "integer"}, 0),
+            ({"type": "number"}, 0.0),
+            ({"type": "boolean"}, False),
+            ({"type": "null"}, None),
+            ({"type": "array", "items": {"type": "string"}}, [""]),
+        ):
+            with self.subTest(schema=schema):
+                self.assertEqual(
+                    structured_output_fallback._json_schema_example(schema),
+                    expected,
+                )
+
+    def test_example_fills_required_properties_only(self):
+        schema = {
+            "type": "object",
+            "properties": {
+                "required_field": {"type": "string"},
+                "optional_field": {"type": "string"},
+            },
+            "required": ["required_field"],
+        }
+
+        self.assertEqual(
+            structured_output_fallback._json_schema_example(schema),
+            {"required_field": ""},
+        )
+
+    def test_example_prefers_const_enum_and_default(self):
+        for schema, expected in (
+            ({"const": 7}, 7),
+            ({"enum": ["draft", "final"]}, "draft"),
+            ({"type": "integer", "default": 42}, 42),
+        ):
+            with self.subTest(schema=schema):
+                self.assertEqual(
+                    structured_output_fallback._json_schema_example(schema),
+                    expected,
+                )
+
+    def test_example_resolves_local_refs(self):
+        schema = {
+            "$defs": {
+                "Step": {
+                    "type": "object",
+                    "properties": {"title": {"type": "string"}},
+                    "required": ["title"],
+                }
+            },
+            "type": "object",
+            "properties": {
+                "step": {"$ref": "#/$defs/Step"},
+                "steps": {"type": "array", "items": {"$ref": "#/$defs/Step"}},
+            },
+            "required": ["step", "steps"],
+        }
+
+        self.assertEqual(
+            structured_output_fallback._json_schema_example(schema),
+            {"step": {"title": ""}, "steps": [{"title": ""}]},
+        )
+
+    def test_example_skips_the_null_branch_of_a_union(self):
+        self.assertEqual(
+            structured_output_fallback._json_schema_example(
+                {"anyOf": [{"type": "null"}, {"type": "integer"}]}
+            ),
+            0,
+        )
+        self.assertIsNone(
+            structured_output_fallback._json_schema_example(
+                {"oneOf": [{"type": "null"}]}
+            )
+        )
+
+    def test_example_rejects_recursive_schemas(self):
+        schema = {
+            "$defs": {
+                "Node": {
+                    "type": "object",
+                    "properties": {"child": {"$ref": "#/$defs/Node"}},
+                    "required": ["child"],
+                }
+            },
+            "$ref": "#/$defs/Node",
+        }
+
+        with self.assertRaisesRegex(ValueError, "recursive"):
+            structured_output_fallback._json_schema_example(schema)
+
+    def test_example_rejects_unsupported_shapes(self):
+        for schema in (
+            {},
+            {"type": "unsupported"},
+            {"$ref": "https://example.com/other.json"},
+            {"$defs": {}, "$ref": "#/$defs/Missing"},
+        ):
+            with self.subTest(schema=schema):
+                with self.assertRaises(ValueError):
+                    structured_output_fallback._json_schema_example(schema)
 
 
 if __name__ == "__main__":

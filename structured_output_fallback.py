@@ -9,15 +9,36 @@ The wrapper is a seam onto SDK behaviour the version in ``requirements.txt``
 defines, not a documented extension point: ``OpenAIChatCompletionsModel``'s
 constructor and ``OpenAIProvider.get_model`` are both read here, so an SDK
 upgrade has to re-check both before widening that pin.
+
+Two provider protocols are selected by :func:`install`. ``deepseek_json`` is
+implemented here; ``minimax_function`` is recognised but still delegates to the
+SDK untouched, so selecting it today behaves like native mode.
 """
 
+import dataclasses
+import json
 import weakref
 
+from agents.agent_output import AgentOutputSchemaBase
+from agents.handoffs import Handoff
+from agents.items import TResponseInputItem
+from agents.model_settings import ModelSettings
+from agents.models.interface import ModelResponse, ModelTracing
 from agents.models.openai_chatcompletions import OpenAIChatCompletionsModel
 from agents.models.openai_provider import OpenAIProvider
+from agents.tool import Tool
+from openai.types.responses.response_prompt_param import ResponsePromptParam
 
 # Captured at import time, before any wrapper replaces the factory.
 _original_get_model = OpenAIProvider.get_model
+
+# DeepSeek's JSON mode only guarantees JSON syntax, and it needs a budget: its
+# documented failure mode is a truncated or empty completion.
+_DEEPSEEK_JSON_MODE = "deepseek_json"
+
+# Enough for the nested schemas the examples declare, and small enough that a
+# schema that only repeats itself is reported instead of walked forever.
+_MAX_EXAMPLE_DEPTH = 8
 
 _mode: str | None = None
 _fallback_max_tokens: int | None = None
@@ -37,9 +58,9 @@ class FallbackChatCompletionsModel(OpenAIChatCompletionsModel):
     guards behaviour on ``isinstance(..., OpenAIChatCompletionsModel)``, and a
     plain delegating ``Model`` would quietly lose those guardrails.
 
-    Registering it changes no request yet: ``get_response`` is still the SDK's
-    own, so an installed adapter with no mode behaves exactly like the model it
-    replaced.
+    Registering it changes no request on its own. With no mode selected, or on
+    a request the selected mode does not cover, ``get_response`` is still the
+    SDK's own.
     """
 
     def __init__(
@@ -60,6 +81,216 @@ class FallbackChatCompletionsModel(OpenAIChatCompletionsModel):
         )
         self._fallback_mode = mode
         self._fallback_max_tokens = fallback_max_tokens
+
+    async def get_response(
+        self,
+        system_instructions: str | None,
+        input: str | list[TResponseInputItem],
+        model_settings: ModelSettings,
+        tools: list[Tool],
+        output_schema: AgentOutputSchemaBase | None,
+        handoffs: list[Handoff],
+        tracing: ModelTracing,
+        previous_response_id: str | None = None,
+        conversation_id: str | None = None,
+        prompt: ResponsePromptParam | None = None,
+    ) -> ModelResponse:
+        """Rewrite typed-output requests the selected mode covers.
+
+        DeepSeek JSON Output applies only to a typed request that is not
+        competing with application tools or handoffs; everything else is left
+        to the SDK. The original ``output_schema`` is always passed through, so
+        the SDK still parses and validates the final content against it.
+        """
+        if not self._uses_deepseek_json(output_schema, tools, handoffs):
+            return await self._sdk_get_response(
+                system_instructions,
+                input,
+                model_settings,
+                tools,
+                output_schema,
+                handoffs,
+                tracing,
+                previous_response_id,
+                conversation_id,
+                prompt,
+            )
+
+        # The budget is a configuration problem, so it is checked before a
+        # schema the adapter cannot describe.
+        settings = self._json_mode_settings(model_settings)
+        instructions = _json_instructions(output_schema) + (
+            system_instructions or ""
+        )
+        return await self._sdk_get_response(
+            instructions,
+            input,
+            settings,
+            tools,
+            output_schema,
+            handoffs,
+            tracing,
+            previous_response_id,
+            conversation_id,
+            prompt,
+        )
+
+    async def _sdk_get_response(
+        self,
+        system_instructions,
+        input,
+        model_settings,
+        tools,
+        output_schema,
+        handoffs,
+        tracing,
+        previous_response_id,
+        conversation_id,
+        prompt,
+    ) -> ModelResponse:
+        return await super().get_response(
+            system_instructions,
+            input,
+            model_settings,
+            tools,
+            output_schema,
+            handoffs,
+            tracing,
+            previous_response_id=previous_response_id,
+            conversation_id=conversation_id,
+            prompt=prompt,
+        )
+
+    def _uses_deepseek_json(self, output_schema, tools, handoffs) -> bool:
+        return (
+            self._fallback_mode == _DEEPSEEK_JSON_MODE
+            and output_schema is not None
+            and not output_schema.is_plain_text()
+            and not tools
+            and not handoffs
+        )
+
+    def _json_mode_settings(self, model_settings: ModelSettings) -> ModelSettings:
+        """Add JSON mode to the settings, keeping every other caller value.
+
+        ``response_format`` has to travel in ``extra_body``: the SDK passes its
+        own ``response_format`` from the output schema, and ``extra_body`` is
+        merged over it by the OpenAI client. ``extra_args`` is not an
+        alternative here - it collides with that keyword and raises instead of
+        overriding it.
+        """
+        max_tokens = (
+            model_settings.max_tokens
+            if model_settings.max_tokens is not None
+            else self._fallback_max_tokens
+        )
+        if max_tokens is None:
+            raise ValueError(
+                "DeepSeek JSON mode needs a token budget: set max_tokens on the "
+                "agent, or AGENT_STRUCTURED_OUTPUT_MAX_TOKENS for the examples "
+                "that set none. DeepSeek truncates JSON output without one."
+            )
+        return dataclasses.replace(
+            model_settings,
+            extra_body={
+                **(model_settings.extra_body or {}),
+                "response_format": {"type": "json_object"},
+            },
+            max_tokens=max_tokens,
+        )
+
+
+def _json_instructions(output_schema: AgentOutputSchemaBase) -> str:
+    """Describe the expected JSON in a system instruction.
+
+    DeepSeek's JSON mode guarantees JSON syntax and nothing else, and it
+    rejects a request whose prompt never mentions JSON, so the schema and a
+    filled-in example both have to be in the prompt. The example is labelled
+    illustrative: it shows the shape, not the answer.
+    """
+    schema = output_schema.json_schema()
+    return (
+        "Respond with JSON only: no prose, no Markdown fences, no extra keys.\n"
+        f"JSON schema:\n{json.dumps(schema)}\n"
+        f"Example (illustrative):\n{json.dumps(_json_schema_example(schema))}\n"
+    )
+
+
+def _json_schema_example(schema: dict[str, object]) -> object:
+    """Build a representative JSON value for ``schema``.
+
+    The result is any JSON value, not only an object: a typed output may be a
+    list or a scalar. Anything the traversal cannot represent - a remote
+    ``$ref``, a schema with no usable type, a cycle - raises instead of
+    producing an example that would mislead the model.
+    """
+    return _example_for(schema, schema)
+
+
+def _example_for(schema: dict[str, object], root: dict[str, object], depth: int = 0):
+    if depth > _MAX_EXAMPLE_DEPTH:
+        raise ValueError("Cannot build a JSON example for recursive output schema")
+
+    if "$ref" in schema:
+        return _example_for(_resolve_ref(schema["$ref"], root), root, depth + 1)
+    if "const" in schema:
+        return schema["const"]
+    if "enum" in schema:
+        return schema["enum"][0]
+    if "default" in schema:
+        return schema["default"]
+
+    # Optional values arrive as a union with null; show the real type.
+    for union_key in ("anyOf", "oneOf"):
+        if union_key in schema:
+            branches = [
+                branch
+                for branch in schema[union_key]
+                if branch.get("type") != "null"
+            ]
+            if not branches:
+                return None
+            return _example_for(branches[0], root, depth + 1)
+
+    kind = schema.get("type")
+    if kind == "object" or "properties" in schema:
+        # Only required properties: an example has to satisfy the schema, and
+        # omitting an optional property always does.
+        required = set(schema.get("required", []))
+        return {
+            name: _example_for(value, root, depth + 1)
+            for name, value in schema.get("properties", {}).items()
+            if name in required
+        }
+    if kind == "array":
+        return [_example_for(schema["items"], root, depth + 1)]
+    if kind == "string":
+        return ""
+    if kind == "integer":
+        return 0
+    if kind == "number":
+        return 0.0
+    if kind == "boolean":
+        return False
+    if kind == "null":
+        return None
+    raise ValueError(f"Cannot build a JSON example for schema type {kind!r}")
+
+
+def _resolve_ref(ref: str, root: dict[str, object]) -> dict[str, object]:
+    """Resolve a ``#/$defs/...`` reference against the schema it came from."""
+    if not ref.startswith("#/"):
+        raise ValueError(f"Cannot build a JSON example for remote $ref {ref!r}")
+
+    target: object = root
+    for part in ref.removeprefix("#/").split("/"):
+        try:
+            target = target[part.replace("~1", "/").replace("~0", "~")]
+        except (KeyError, TypeError):
+            raise ValueError(
+                f"Cannot resolve $ref {ref!r} in the output schema"
+            ) from None
+    return target
 
 
 def install(mode: str, max_tokens: int | None) -> None:
