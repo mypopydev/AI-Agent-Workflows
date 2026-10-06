@@ -170,7 +170,7 @@ an LKEAP Token Plan relay, and are not provider guarantees. `deepseek_json`
 passed there for both plain and tool-bearing agents. `minimax_function` was
 verified for plain typed agents only: its tool-bearing two-phase path succeeded
 in 3 of 5 runs, and the two failures answered `finish_reason=stop` with no tool
-call for a byte-identical request. Treat that path as unreliable and do not
+call for a request identical in shape. Treat that path as unreliable and do not
 rely on it — the cause was not identified and is not fixed here, and it may be
 a relay characteristic rather than a MiniMax one, so another endpoint can
 behave differently.

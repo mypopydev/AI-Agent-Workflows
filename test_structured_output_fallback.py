@@ -340,6 +340,47 @@ class FallbackRegistrationTests(unittest.TestCase):
             model, structured_output_fallback.FallbackChatCompletionsModel
         )
 
+    # --- the SDK version the adapter reads internals from -----------------
+
+    # The version is injected, not read from the environment: what is under
+    # test is that install() accepts the pinned release and rejects any other,
+    # not which release happens to be installed here.
+    def test_install_accepts_the_pinned_sdk_version(self):
+        pinned = structured_output_fallback._SUPPORTED_SDK_VERSIONS[0]
+        with patch.object(
+            structured_output_fallback,
+            "_installed_sdk_version",
+            return_value=pinned,
+        ):
+            structured_output_fallback.install("deepseek_json", None)
+
+        model = self._provider().get_model("deepseek-chat")
+        self.assertIsInstance(
+            model, structured_output_fallback.FallbackChatCompletionsModel
+        )
+
+    def test_install_rejects_an_unsupported_sdk_version(self):
+        with patch.object(
+            structured_output_fallback,
+            "_installed_sdk_version",
+            return_value="99.0.0",
+        ):
+            with self.assertRaises(RuntimeError) as raised:
+                structured_output_fallback.install("deepseek_json", None)
+
+        message = str(raised.exception)
+        # The operator has to be told what to widen and what to re-check: an
+        # upgrade that fails here is otherwise an AttributeError from inside
+        # OpenAIProvider.get_model, or no error at all.
+        self.assertIn("99.0.0", message)
+        self.assertIn("requirements.txt", message)
+        self.assertIn("_strict_feature_validation", message)
+        self.assertIn("extra_body", message)
+        # Rejected before anything was installed, so the SDK factory is intact.
+        self.assertIs(OpenAIProvider.get_model, _PRISTINE_GET_MODEL)
+        self.assertFalse(structured_output_fallback._installed)
+        self.assertIsNone(structured_output_fallback._mode)
+
 
 class ResearchStepModel(BaseModel):
     title: str
@@ -590,6 +631,14 @@ class DeepSeekFallbackTests(unittest.TestCase):
             system,
         )
 
+    def test_caller_tool_choice_is_not_sent_when_no_tools_are_declared(self):
+        """JSON mode declares no tools, so a tool_choice would be unanswerable."""
+        self._run(model_settings=ModelSettings(tool_choice="required"))
+
+        body = self._one_request()
+        self.assertNotIn("tool_choice", body)
+        self.assertEqual(body["response_format"], {"type": "json_object"})
+
     def test_unrelated_extra_body_entries_are_preserved(self):
         self._run(
             model_settings=ModelSettings(
@@ -765,6 +814,9 @@ class DeepSeekFallbackTests(unittest.TestCase):
         self.assertTrue(work["tools"])
         self.assertEqual(formatter["response_format"], {"type": "json_object"})
         self.assertNotIn("tools", formatter)
+        # The formatter offers no tool, so a tool_choice beside that empty tool
+        # list is a provider error rather than a hint.
+        self.assertNotIn("tool_choice", formatter)
 
     def test_recursive_output_schema_fails_before_the_request(self):
         with self.assertRaisesRegex(ValueError, "recursive"):

@@ -27,6 +27,7 @@ import weakref
 from collections.abc import AsyncIterator
 from typing import Any
 
+import agents
 from agents.agent_output import AgentOutputSchemaBase
 from agents.exceptions import ModelBehaviorError
 from agents.handoffs import Handoff
@@ -489,9 +490,14 @@ class FallbackChatCompletionsModel(OpenAIChatCompletionsModel):
         merged over it by the OpenAI client. ``extra_args`` is not an
         alternative here - it collides with that keyword and raises instead of
         overriding it.
+
+        ``tool_choice`` is dropped for the reason the MiniMax side replaces it:
+        this protocol declares no tools, so a caller's ``tool_choice`` would
+        reach the provider next to an empty tool list, which it rejects.
         """
         return dataclasses.replace(
             model_settings,
+            tool_choice=None,
             extra_body={
                 **(model_settings.extra_body or {}),
                 "response_format": {"type": "json_object"},
@@ -943,6 +949,53 @@ def _resolve_ref(ref: str, root: dict[str, object]) -> dict[str, object]:
     return target
 
 
+# The Agents SDK release this adapter was read against, and the one
+# requirements.txt pins.
+_SUPPORTED_SDK_VERSIONS = ("0.23.1",)
+
+# What an SDK upgrade has to re-check before that pin is widened. None of it is
+# a documented extension point, and the last entry is the one that fails
+# silently: the fallback stays installed and quietly stops taking effect.
+_SDK_DEPENDENCIES = (
+    "OpenAIProvider.get_model",
+    "the OpenAIChatCompletionsModel constructor",
+    "OpenAIChatCompletionsModel._client",
+    "OpenAIChatCompletionsModel._strict_feature_validation",
+    "OpenAIChatCompletionsModel._buffer_streamed_tool_calls",
+    "the OpenAI client merging extra_body over the SDK's own response_format",
+)
+
+
+def _installed_sdk_version() -> str:
+    """The installed Agents SDK release, as the SDK reports it."""
+    return agents.__version__
+
+
+def _check_sdk_version() -> None:
+    """Refuse to install on an SDK release this adapter was not read against.
+
+    The adapter is a seam onto SDK internals, so an upgrade is not something it
+    can survive by assumption: on a release that changed any of them, the
+    failure surfaces as an ``AttributeError`` or ``TypeError`` raised inside
+    ``OpenAIProvider.get_model`` with nothing to point at this module, or - for
+    the ``extra_body`` precedence - as no error at all. Failing here instead
+    names both.
+    """
+    version = _installed_sdk_version()
+    if version in _SUPPORTED_SDK_VERSIONS:
+        return
+    raise RuntimeError(
+        "The structured-output fallback does not support openai-agents "
+        f"{version}: it reads SDK internals that only "
+        f"{'/'.join(_SUPPORTED_SDK_VERSIONS)} defines, and that is what "
+        "requirements.txt pins. Widen the pin only after re-checking "
+        + ", ".join(_SDK_DEPENDENCIES)
+        + ". On any other release this adapter either raises from inside "
+        "OpenAIProvider.get_model without naming itself, or stays installed "
+        "while it stops rewriting the request."
+    )
+
+
 def install(mode: str, max_tokens: int | None) -> None:
     """Install the provider factory adapter once.
 
@@ -952,6 +1005,10 @@ def install(mode: str, max_tokens: int | None) -> None:
     under the previous settings is still carrying them.
     """
     global _mode, _fallback_max_tokens, _installed
+
+    # Checked before any state changes, so an unsupported release cannot leave
+    # a half-installed adapter behind.
+    _check_sdk_version()
 
     if _mode != mode or _fallback_max_tokens != max_tokens:
         _model_caches.clear()
