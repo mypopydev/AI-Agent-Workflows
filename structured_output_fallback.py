@@ -67,8 +67,13 @@ def install(mode: str, max_tokens: int | None) -> None:
 
     Calling it again only updates the selected mode: the factory is wrapped a
     single time, so importing ``agents_config`` twice cannot stack wrappers.
+    Changing the settings drops the cached adapters, because a model built
+    under the previous settings is still carrying them.
     """
     global _mode, _fallback_max_tokens, _installed
+
+    if _mode != mode or _fallback_max_tokens != max_tokens:
+        _model_caches.clear()
 
     _mode = mode
     _fallback_max_tokens = max_tokens

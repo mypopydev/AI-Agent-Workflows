@@ -233,6 +233,40 @@ class FallbackRegistrationTests(unittest.TestCase):
         self.assertIs(first, provider.get_model("deepseek-chat"))
         self.assertIsNot(first, provider.get_model("glm-4-plus"))
 
+    def test_mode_change_replaces_already_cached_adapters(self):
+        structured_output_fallback.install("deepseek_json", None)
+        provider = self._provider()
+        cached = provider.get_model("deepseek-chat")
+        self.assertEqual(cached._fallback_mode, "deepseek_json")
+
+        structured_output_fallback.install("minimax_function", 2048)
+        adapted = provider.get_model("deepseek-chat")
+
+        self.assertIsNot(adapted, cached)
+        self.assertEqual(adapted._fallback_mode, "minimax_function")
+        self.assertEqual(adapted._fallback_max_tokens, 2048)
+
+    def test_token_budget_change_replaces_already_cached_adapters(self):
+        structured_output_fallback.install("deepseek_json", 1024)
+        provider = self._provider()
+        cached = provider.get_model("deepseek-chat")
+        self.assertEqual(cached._fallback_max_tokens, 1024)
+
+        structured_output_fallback.install("deepseek_json", 4096)
+        adapted = provider.get_model("deepseek-chat")
+
+        self.assertIsNot(adapted, cached)
+        self.assertEqual(adapted._fallback_max_tokens, 4096)
+
+    def test_reinstalling_the_same_settings_keeps_the_cached_adapter(self):
+        structured_output_fallback.install("deepseek_json", 1024)
+        provider = self._provider()
+        cached = provider.get_model("deepseek-chat")
+
+        structured_output_fallback.install("deepseek_json", 1024)
+
+        self.assertIs(provider.get_model("deepseek-chat"), cached)
+
     def test_install_is_idempotent(self):
         structured_output_fallback.install("deepseek_json", None)
         installed = OpenAIProvider.get_model
