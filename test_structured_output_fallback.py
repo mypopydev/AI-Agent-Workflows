@@ -32,7 +32,12 @@ import httpx2
 from agents import Agent, Runner, function_tool, set_tracing_disabled
 from agents.agent_output import AgentOutputSchema
 from agents.exceptions import ModelBehaviorError
-from agents.items import ResponseOutputMessage, ResponseOutputRefusal
+from agents.items import (
+    ResponseOutputMessage,
+    ResponseOutputRefusal,
+    ResponseOutputText,
+    ToolCallItem,
+)
 from agents.model_settings import ModelSettings
 from agents.models.interface import ModelTracing
 from agents.tracing import setup as tracing_setup
@@ -680,10 +685,22 @@ class DeepSeekFallbackTests(unittest.TestCase):
         self.assertNotIn("response_format", self._one_request())
 
     def test_minimax_mode_still_delegates_to_the_sdk(self):
-        self._run(model=self._model(mode="minimax_function"))
+        """A MiniMax agent Task 3 does not cover keeps the native request."""
 
-        self.assertEqual(
-            self._one_request()["response_format"]["type"], "json_schema"
+        @function_tool
+        def lookup_library(name: str) -> str:
+            """Look a library up in the catalogue."""
+            return "found"
+
+        self._run(
+            model=self._model(mode="minimax_function"), tools=[lookup_library]
+        )
+
+        body = self._one_request()
+        self.assertEqual(body["response_format"]["type"], "json_schema")
+        self.assertNotIn(
+            structured_output_fallback._FORMAT_TOOL_NAME,
+            json.dumps(body.get("tools", [])),
         )
 
     def test_agents_with_tools_keep_the_native_request(self):
@@ -847,6 +864,341 @@ class DeepSeekFallbackTests(unittest.TestCase):
             with self.subTest(schema=schema):
                 with self.assertRaises(ValueError):
                     structured_output_fallback._json_schema_example(schema)
+
+
+class MiniMaxFallbackTests(unittest.TestCase):
+    """The MiniMax Function Calling adaptation at the HTTP level.
+
+    The provider is driven with a mock Chat Completion that answers with a
+    function call, so these tests cover both halves of the protocol: the
+    request that forces the synthetic formatting function, and the conversion
+    of its arguments back into the assistant text the typed-output validator
+    consumes.
+    """
+
+    def setUp(self) -> None:
+        self.requests: list[dict[str, object]] = []
+        self.arguments = json.dumps(
+            {
+                "topic": "structured output",
+                "lead_step": {
+                    "title": "compare providers",
+                    "estimated_minutes": 30,
+                },
+                "status": "draft",
+                "risks": ["provider drift"],
+            }
+        )
+        self.tool_calls: list[dict[str, object]] | None = [
+            self._call(self.arguments)
+        ]
+        # Ordinary assistant text: what the provider sends instead of a call.
+        self.reply: str | None = None
+        self.refusal: str | None = None
+        self._clients: list[AsyncOpenAI] = []
+
+        self._previous_trace_provider = tracing_setup.GLOBAL_TRACE_PROVIDER
+        tracing_setup.GLOBAL_TRACE_PROVIDER = None
+        set_tracing_disabled(True)
+
+    def tearDown(self) -> None:
+        tracing_setup.GLOBAL_TRACE_PROVIDER = self._previous_trace_provider
+        asyncio.run(self._close_clients())
+
+    async def _close_clients(self) -> None:
+        for client in self._clients:
+            await client.close()
+
+    # --- fixtures ---------------------------------------------------------
+
+    def _call(
+        self,
+        arguments: str,
+        name: str = "emit_typed_output",
+        call_id: str = "call_1",
+    ) -> dict[str, object]:
+        return {
+            "id": call_id,
+            "type": "function",
+            "function": {"name": name, "arguments": arguments},
+        }
+
+    def _schema(self) -> AgentOutputSchema:
+        return AgentOutputSchema(ResearchPlanModel, strict_json_schema=True)
+
+    def _handle_request(self, request: httpx2.Request) -> httpx2.Response:
+        self.requests.append(json.loads(request.content))
+        message: dict[str, object] = {
+            "role": "assistant",
+            "content": self.reply,
+        }
+        if self.refusal is not None:
+            message["refusal"] = self.refusal
+        if self.tool_calls is not None:
+            message["tool_calls"] = self.tool_calls
+        return httpx2.Response(
+            200,
+            headers={"x-request-id": "req-minimax"},
+            json={
+                "id": "chatcmpl-test",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "MiniMax-Text-01",
+                "choices": [
+                    {"index": 0, "message": message, "finish_reason": "stop"}
+                ],
+                "usage": {
+                    "prompt_tokens": 11,
+                    "completion_tokens": 7,
+                    "total_tokens": 18,
+                },
+            },
+        )
+
+    def _model(
+        self, mode: str = "minimax_function", max_tokens: int | None = None
+    ):
+        client = AsyncOpenAI(
+            api_key="test-key",
+            base_url=_BASE_URL,
+            http_client=httpx2.AsyncClient(
+                transport=httpx2.MockTransport(self._handle_request)
+            ),
+        )
+        self._clients.append(client)
+        return structured_output_fallback.FallbackChatCompletionsModel(
+            model="MiniMax-Text-01",
+            openai_client=client,
+            mode=mode,
+            fallback_max_tokens=max_tokens,
+        )
+
+    def _run(self, *, model=None, output_type=ResearchPlanModel, **kwargs):
+        agent = Agent(
+            name="planner",
+            instructions="Plan the research.",
+            model=model or self._model(),
+            output_type=output_type,
+            **kwargs,
+        )
+        return asyncio.run(Runner.run(agent, "Plan some research."))
+
+    def _get_response(self, *, model_settings=None, output_schema=None):
+        return asyncio.run(
+            self._model().get_response(
+                "Plan the research.",
+                "Plan some research.",
+                ModelSettings() if model_settings is None else model_settings,
+                [],
+                self._schema() if output_schema is None else output_schema,
+                [],
+                ModelTracing.DISABLED,
+            )
+        )
+
+    def _one_request(self) -> dict[str, object]:
+        self.assertEqual(len(self.requests), 1, "expected exactly one request")
+        return self.requests[0]
+
+    def _only_function(self, body: dict[str, object]) -> dict[str, object]:
+        tools = body["tools"]
+        self.assertEqual(len(tools), 1, "expected exactly one tool")
+        return tools[0]["function"]
+
+    # --- the serialized request -------------------------------------------
+
+    def test_request_forces_only_the_formatting_function(self):
+        self._run()
+
+        body = self._one_request()
+        name = structured_output_fallback._FORMAT_TOOL_NAME
+        self.assertEqual(
+            body["tool_choice"],
+            {"type": "function", "function": {"name": name}},
+        )
+        self.assertEqual(
+            self._only_function(body)["name"],
+            structured_output_fallback._FORMAT_TOOL_NAME,
+        )
+
+    def test_formatting_tool_schema_is_the_output_schema(self):
+        self._run()
+
+        function = self._only_function(self._one_request())
+        self.assertEqual(function["parameters"], self._schema().json_schema())
+        self.assertFalse(function["strict"])
+
+    def test_native_json_schema_response_format_is_not_sent(self):
+        self._run()
+
+        body = self._one_request()
+        self.assertNotIn("response_format", body)
+        self.assertNotIn("json_schema", json.dumps(body))
+
+    def test_caller_response_format_in_extra_body_is_dropped(self):
+        self._run(
+            model_settings=ModelSettings(
+                extra_body={
+                    "response_format": {"type": "json_object"},
+                    "thinking": {"type": "disabled"},
+                }
+            )
+        )
+
+        body = self._one_request()
+        self.assertNotIn("response_format", body)
+        self.assertEqual(body["thinking"], {"type": "disabled"})
+
+    def test_unrelated_model_settings_are_preserved(self):
+        self._run(
+            model_settings=ModelSettings(
+                temperature=0.25, top_p=0.5, max_tokens=123, presence_penalty=0.75
+            )
+        )
+
+        body = self._one_request()
+        self.assertEqual(body["temperature"], 0.25)
+        self.assertEqual(body["top_p"], 0.5)
+        self.assertEqual(body["max_tokens"], 123)
+        self.assertEqual(body["presence_penalty"], 0.75)
+
+    # --- the converted response -------------------------------------------
+
+    def test_valid_arguments_become_the_typed_output(self):
+        result = self._run()
+
+        self.assertEqual(result.final_output.topic, "structured output")
+        self.assertEqual(result.final_output.status, "draft")
+        self.assertEqual(result.final_output.lead_step.estimated_minutes, 30)
+        self.assertEqual(len(self.requests), 1)
+
+    def test_function_call_is_converted_to_output_text(self):
+        response = self._get_response()
+
+        self.assertEqual(len(response.output), 1)
+        message = response.output[0]
+        self.assertIsInstance(message, ResponseOutputMessage)
+        self.assertEqual(len(message.content), 1)
+        text = message.content[0]
+        self.assertIsInstance(text, ResponseOutputText)
+        self.assertEqual(text.text, self.arguments)
+        self.assertEqual(response.usage.requests, 1)
+        self.assertEqual(response.usage.total_tokens, 18)
+
+    def test_request_id_and_raw_usage_are_preserved(self):
+        response = self._get_response(
+            model_settings=ModelSettings(preserve_raw_usage=True)
+        )
+
+        self.assertEqual(response.request_id, "req-minimax")
+        self.assertEqual(response.raw_usage["total_tokens"], 18)
+
+    def test_missing_function_call_fails_visibly(self):
+        self.tool_calls = None
+        self.reply = "Here is the plan instead."
+
+        with self.assertRaisesRegex(ModelBehaviorError, "emit_typed_output"):
+            self._run()
+
+    def test_unrelated_function_name_fails_visibly(self):
+        self.tool_calls = [self._call(self.arguments, name="lookup_library")]
+
+        with self.assertRaisesRegex(ModelBehaviorError, "emit_typed_output"):
+            self._run()
+
+    def test_multiple_formatting_calls_fail_visibly(self):
+        self.tool_calls = [
+            self._call(self.arguments),
+            self._call(self.arguments, call_id="call_2"),
+        ]
+
+        with self.assertRaisesRegex(ModelBehaviorError, "emit_typed_output"):
+            self._run()
+
+    def test_invalid_argument_json_fails_visibly(self):
+        self.tool_calls = [self._call('{"topic": "half')]
+
+        with self.assertRaises(ModelBehaviorError):
+            self._run()
+
+    def test_schema_mismatch_fails_visibly(self):
+        self.tool_calls = [self._call(json.dumps({"topic": "structured output"}))]
+
+        with self.assertRaises(ModelBehaviorError):
+            self._run()
+
+    def test_refusal_fails_visibly(self):
+        self.tool_calls = None
+        self.refusal = "I cannot help with that."
+
+        with self.assertRaisesRegex(ModelBehaviorError, "refusal"):
+            self._run()
+
+    def test_empty_output_fails_visibly(self):
+        """HTTP 200 with neither a call nor text: not a typed-output pass."""
+        self.tool_calls = None
+        self.reply = None
+
+        with self.assertRaisesRegex(ModelBehaviorError, "emit_typed_output"):
+            self._run()
+
+    def test_no_synthetic_tool_call_reaches_the_runner(self):
+        result = self._run()
+
+        tool_calls = [
+            item for item in result.new_items if isinstance(item, ToolCallItem)
+        ]
+        self.assertEqual(tool_calls, [])
+        self.assertIsInstance(result.final_output, ResearchPlanModel)
+
+    def test_formatting_tool_invoker_raises_if_called(self):
+        tool = structured_output_fallback._format_tool(self._schema())
+
+        with self.assertRaises(ModelBehaviorError):
+            asyncio.run(tool.on_invoke_tool(None, self.arguments))
+
+    # --- requests the adaptation must leave alone --------------------------
+
+    def test_plain_text_agents_keep_the_native_request(self):
+        self.tool_calls = None
+        self.reply = "Here is the plan."
+        self._run(output_type=str)
+
+        body = self._one_request()
+        self.assertNotIn("tools", body)
+        self.assertNotIn("response_format", body)
+
+    def test_agents_with_tools_keep_the_native_request(self):
+        self.tool_calls = None
+        self.reply = self.arguments
+
+        @function_tool
+        def lookup_library(name: str) -> str:
+            """Look a library up in the catalogue."""
+            return "found"
+
+        self._run(tools=[lookup_library])
+
+        body = self._one_request()
+        self.assertEqual(body["response_format"]["type"], "json_schema")
+        self.assertNotIn(
+            structured_output_fallback._FORMAT_TOOL_NAME,
+            json.dumps(body["tools"]),
+        )
+
+    def test_agents_with_handoffs_keep_the_native_request(self):
+        self.tool_calls = None
+        self.reply = self.arguments
+        specialist = Agent(name="specialist", model=self._model())
+
+        self._run(handoffs=[specialist])
+
+        body = self._one_request()
+        self.assertEqual(body["response_format"]["type"], "json_schema")
+        self.assertNotIn(
+            structured_output_fallback._FORMAT_TOOL_NAME,
+            json.dumps(body["tools"]),
+        )
 
 
 if __name__ == "__main__":

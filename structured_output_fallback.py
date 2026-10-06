@@ -10,19 +10,23 @@ defines, not a documented extension point: ``OpenAIChatCompletionsModel``'s
 constructor and ``OpenAIProvider.get_model`` are both read here, so an SDK
 upgrade has to re-check both before widening that pin.
 
-Two provider protocols are selected by :func:`install`. ``deepseek_json`` is
-implemented here; ``minimax_function`` is recognised but still delegates to the
-SDK untouched, so selecting it today behaves like native mode.
+Two provider protocols are selected by :func:`install`, and both are
+implemented here: ``deepseek_json`` asks for JSON mode in the request, and
+``minimax_function`` routes the typed output through a synthetic function call
+instead of a JSON Schema response format.
 """
 
 import dataclasses
 import json
+import uuid
 import weakref
+from typing import Any
 
 from agents.agent_output import AgentOutputSchemaBase
 from agents.exceptions import ModelBehaviorError
 from agents.handoffs import Handoff
 from agents.items import (
+    ResponseFunctionToolCall,
     ResponseOutputMessage,
     ResponseOutputRefusal,
     ResponseOutputText,
@@ -32,7 +36,8 @@ from agents.model_settings import ModelSettings
 from agents.models.interface import ModelResponse, ModelTracing
 from agents.models.openai_chatcompletions import OpenAIChatCompletionsModel
 from agents.models.openai_provider import OpenAIProvider
-from agents.tool import Tool
+from agents.tool import FunctionTool, Tool
+from agents.tool_context import ToolContext
 from openai.types.responses.response_prompt_param import ResponsePromptParam
 
 # Captured at import time, before any wrapper replaces the factory.
@@ -41,6 +46,14 @@ _original_get_model = OpenAIProvider.get_model
 # DeepSeek's JSON mode only guarantees JSON syntax, and it needs a budget: its
 # documented failure mode is a truncated or empty completion.
 _DEEPSEEK_JSON_MODE = "deepseek_json"
+
+# MiniMax's guide documents Function Calling but not JSON Schema
+# ``response_format``, so the typed output is collected as a function call.
+_MINIMAX_FUNCTION_MODE = "minimax_function"
+
+# Reserved for the adapter's own formatting call. An application tool must
+# never be given this name: the two would be indistinguishable in a response.
+_FORMAT_TOOL_NAME = "emit_typed_output"
 
 # How many schema nodes one example traversal may expand. Generous next to the
 # declared example schemas, and small enough that an example stays readable in
@@ -104,16 +117,23 @@ class FallbackChatCompletionsModel(OpenAIChatCompletionsModel):
     ) -> ModelResponse:
         """Rewrite typed-output requests the selected mode covers.
 
-        DeepSeek JSON Output applies only to a typed request that is not
-        competing with application tools or handoffs; everything else is left
-        to the SDK. The original ``output_schema`` is always passed through, so
-        the SDK still parses and validates the final content against it.
+        Both protocols apply only to a typed request that is not competing
+        with application tools or handoffs; everything else is left to the SDK.
+        The original ``output_schema`` is always passed through on the DeepSeek
+        path, so the SDK still parses and validates the final content against
+        it; MiniMax validates the arguments here and hands the SDK plain text.
         """
-        if not self._uses_deepseek_json(output_schema, tools, handoffs):
-            return await self._sdk_get_response(
-                system_instructions,
+        if self._uses_deepseek_json(output_schema, tools, handoffs):
+            # The budget is a configuration problem, so it is checked before a
+            # schema the adapter cannot describe.
+            settings = self._json_mode_settings(model_settings)
+            instructions = _json_instructions(output_schema) + (
+                system_instructions or ""
+            )
+            response = await self._sdk_get_response(
+                instructions,
                 input,
-                model_settings,
+                settings,
                 tools,
                 output_schema,
                 handoffs,
@@ -122,17 +142,31 @@ class FallbackChatCompletionsModel(OpenAIChatCompletionsModel):
                 conversation_id,
                 prompt,
             )
+            _reject_silent_empty_output(response)
+            return response
 
-        # The budget is a configuration problem, so it is checked before a
-        # schema the adapter cannot describe.
-        settings = self._json_mode_settings(model_settings)
-        instructions = _json_instructions(output_schema) + (
-            system_instructions or ""
-        )
-        response = await self._sdk_get_response(
-            instructions,
+        if self._uses_minimax_function(output_schema, tools, handoffs):
+            # The schema travels as the function's parameter schema instead of
+            # a response format, so the SDK is given no output schema at all:
+            # this adapter validates the arguments against the real one.
+            response = await self._sdk_get_response(
+                system_instructions,
+                input,
+                self._function_call_settings(model_settings),
+                [_format_tool(output_schema)],
+                None,
+                handoffs,
+                tracing,
+                previous_response_id,
+                conversation_id,
+                prompt,
+            )
+            return _function_call_to_text(response, output_schema)
+
+        return await self._sdk_get_response(
+            system_instructions,
             input,
-            settings,
+            model_settings,
             tools,
             output_schema,
             handoffs,
@@ -141,8 +175,6 @@ class FallbackChatCompletionsModel(OpenAIChatCompletionsModel):
             conversation_id,
             prompt,
         )
-        _reject_silent_empty_output(response)
-        return response
 
     async def _sdk_get_response(
         self,
@@ -173,8 +205,15 @@ class FallbackChatCompletionsModel(OpenAIChatCompletionsModel):
     def _uses_deepseek_json(self, output_schema, tools, handoffs) -> bool:
         return (
             self._fallback_mode == _DEEPSEEK_JSON_MODE
-            and output_schema is not None
-            and not output_schema.is_plain_text()
+            and _is_typed_output(output_schema)
+            and not tools
+            and not handoffs
+        )
+
+    def _uses_minimax_function(self, output_schema, tools, handoffs) -> bool:
+        return (
+            self._fallback_mode == _MINIMAX_FUNCTION_MODE
+            and _is_typed_output(output_schema)
             and not tools
             and not handoffs
         )
@@ -208,6 +247,28 @@ class FallbackChatCompletionsModel(OpenAIChatCompletionsModel):
             max_tokens=max_tokens,
         )
 
+    def _function_call_settings(
+        self, model_settings: ModelSettings
+    ) -> ModelSettings:
+        """Force the formatting function, keeping every other caller value.
+
+        Withholding ``output_schema`` already removes the SDK's own
+        ``response_format``, but a caller may have set one in ``extra_body``,
+        and the OpenAI client merges that over the keyword. This protocol
+        speaks in tool calls, so the entry is dropped rather than replaced.
+        """
+        extra_body = dict(model_settings.extra_body or {})
+        extra_body.pop("response_format", None)
+        return dataclasses.replace(
+            model_settings,
+            tool_choice=_FORMAT_TOOL_NAME,
+            extra_body=extra_body or None,
+        )
+
+
+def _is_typed_output(output_schema: AgentOutputSchemaBase | None) -> bool:
+    return output_schema is not None and not output_schema.is_plain_text()
+
 
 def _reject_silent_empty_output(response: ModelResponse) -> None:
     """Fail a JSON-mode response that carries no assistant text or refusal.
@@ -237,6 +298,120 @@ def _reject_silent_empty_output(response: ModelResponse) -> None:
         "text or refusal, so there is no JSON output to validate. This is the "
         "documented DeepSeek empty-content failure: raise max_tokens, or check "
         "that the endpoint really supports JSON mode."
+    )
+
+
+def _format_tool(output_schema: AgentOutputSchemaBase) -> FunctionTool:
+    """Build the formatting-only function that carries the output schema.
+
+    The parameter schema is the declared output schema itself, so the shape is
+    described through the one mechanism the provider's guide documents.
+    Strictness is off: it is an OpenAI Responses guarantee, not one this
+    endpoint's Function Calling is documented to honour.
+
+    The invoker only raises. The adapter turns the call into text and never
+    leaves it in the response, so a call reaching the tool runtime means the
+    adapter lost its own call - which would turn a typed output into a tool
+    result.
+    """
+    return FunctionTool(
+        name=_FORMAT_TOOL_NAME,
+        description="Emit the final answer as JSON matching the schema.",
+        params_json_schema=output_schema.json_schema(),
+        on_invoke_tool=_reject_format_tool_invocation,
+        strict_json_schema=False,
+    )
+
+
+async def _reject_format_tool_invocation(
+    context: ToolContext[Any], arguments: str
+) -> Any:
+    """Fail if the formatting call ever escapes the adapter."""
+    raise ModelBehaviorError(
+        f"{_FORMAT_TOOL_NAME!r} is an adapter formatting call: it is converted "
+        "into the typed output and must never be executed. Reaching the tool "
+        "runtime means the MiniMax function-call fallback failed to intercept "
+        "its own call."
+    )
+
+
+def _function_call_to_text(
+    response: ModelResponse, output_schema: AgentOutputSchemaBase
+) -> ModelResponse:
+    """Replace the formatting call with the assistant text it carries.
+
+    The call is an adapter detail: the runner knows nothing about the tool and
+    would either fail on an unknown name or execute it. Exactly one correctly
+    named call is accepted, its arguments are validated against the schema the
+    caller declared, and the usage and request ID of that single request are
+    kept.
+    """
+    calls = [
+        item
+        for item in response.output
+        if isinstance(item, ResponseFunctionToolCall)
+    ]
+    if len(calls) != 1 or calls[0].name != _FORMAT_TOOL_NAME:
+        raise ModelBehaviorError(_missing_format_call_message(response, calls))
+
+    arguments = calls[0].arguments
+    # Raises ModelBehaviorError on any argument JSON the schema does not accept.
+    output_schema.validate_json(arguments)
+
+    message = ResponseOutputMessage(
+        id=f"msg_{uuid.uuid4().hex}",
+        content=[
+            ResponseOutputText(
+                text=arguments,
+                type="output_text",
+                annotations=[],
+                logprobs=[],
+            )
+        ],
+        role="assistant",
+        type="message",
+        status="completed",
+    )
+    return ModelResponse(
+        output=[message],
+        usage=response.usage,
+        response_id=None,
+        request_id=response.request_id,
+        raw_usage=response.raw_usage,
+    )
+
+
+def _missing_format_call_message(
+    response: ModelResponse, calls: list[ResponseFunctionToolCall]
+) -> str:
+    """Say why a function-call response carries no typed output.
+
+    A refusal and a missing call are both terminal answers with no arguments,
+    but only one of them tells the operator what the provider decided, so they
+    are reported differently.
+    """
+    refusal = next(
+        (
+            part.refusal
+            for item in response.output
+            if isinstance(item, ResponseOutputMessage)
+            for part in item.content
+            if isinstance(part, ResponseOutputRefusal)
+        ),
+        None,
+    )
+    if refusal is not None:
+        reason = f"the provider returned a refusal: {refusal}"
+    elif calls:
+        reason = f"it returned calls to {[call.name for call in calls]}"
+    else:
+        reason = "it returned no function call"
+
+    return (
+        f"MiniMax function calling expected exactly one {_FORMAT_TOOL_NAME!r} "
+        f"call, but {reason}. A function-call response that does not carry the "
+        "typed output is a typed-output failure, not an empty result: check "
+        "that the endpoint really supports function calling."
     )
 
 
