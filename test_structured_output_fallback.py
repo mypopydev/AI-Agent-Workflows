@@ -25,14 +25,16 @@ import json
 import os
 import sys
 import unittest
-from typing import Literal
+from typing import Any, Literal
 from unittest.mock import patch
 
 import httpx2
 from agents import Agent, Runner, function_tool, set_tracing_disabled
 from agents.agent_output import AgentOutputSchema
 from agents.exceptions import ModelBehaviorError
+from agents.handoffs import handoff
 from agents.items import (
+    ResponseFunctionToolCall,
     ResponseOutputMessage,
     ResponseOutputRefusal,
     ResponseOutputText,
@@ -40,6 +42,7 @@ from agents.items import (
 )
 from agents.model_settings import ModelSettings
 from agents.models.interface import ModelTracing
+from agents.tool import FunctionTool
 from agents.tracing import setup as tracing_setup
 from openai import AsyncOpenAI
 from pydantic import BaseModel, create_model
@@ -441,6 +444,9 @@ class DeepSeekFallbackTests(unittest.TestCase):
         )
         self.finish_reason = "stop"
         self.refusal: str | None = None
+        # Assistant messages the provider returns, one per request. Empty means
+        # every request is answered with the canned ``self.reply`` message.
+        self.script: list[dict[str, object]] = []
         self._clients: list[AsyncOpenAI] = []
 
         # Tracing defaults to a processor that exports to api.openai.com, so it
@@ -459,9 +465,12 @@ class DeepSeekFallbackTests(unittest.TestCase):
 
     def _handle_request(self, request: httpx2.Request) -> httpx2.Response:
         self.requests.append(json.loads(request.content))
-        message: dict[str, object] = {"role": "assistant", "content": self.reply}
-        if self.refusal is not None:
-            message["refusal"] = self.refusal
+        if self.script:
+            message = dict(self.script.pop(0))
+        else:
+            message = {"role": "assistant", "content": self.reply}
+            if self.refusal is not None:
+                message["refusal"] = self.refusal
         return httpx2.Response(
             200,
             json={
@@ -521,6 +530,19 @@ class DeepSeekFallbackTests(unittest.TestCase):
             **kwargs,
         )
         return asyncio.run(Runner.run(agent, "Plan some research."))
+
+    def _call(
+        self,
+        arguments: str,
+        name: str = "emit_typed_output",
+        call_id: str = "call_1",
+    ) -> dict[str, object]:
+        """One Chat Completions tool call, in the provider's wire shape."""
+        return {
+            "id": call_id,
+            "type": "function",
+            "function": {"name": name, "arguments": arguments},
+        }
 
     def _one_request(self) -> dict[str, object]:
         self.assertEqual(len(self.requests), 1, "expected exactly one request")
@@ -684,26 +706,49 @@ class DeepSeekFallbackTests(unittest.TestCase):
 
         self.assertNotIn("response_format", self._one_request())
 
-    def test_minimax_mode_still_delegates_to_the_sdk(self):
-        """A MiniMax agent Task 3 does not cover keeps the native request."""
+    def test_minimax_mode_tools_run_a_work_phase_then_a_formatter(self):
+        """A MiniMax tool agent Task 3 does not cover takes the two-phase path."""
 
         @function_tool
         def lookup_library(name: str) -> str:
             """Look a library up in the catalogue."""
             return "found"
 
+        self.script = [
+            {"role": "assistant", "content": "Found httpx2."},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [self._call(self.reply)],
+            },
+        ]
+
         self._run(
             model=self._model(mode="minimax_function"), tools=[lookup_library]
         )
 
-        body = self._one_request()
-        self.assertEqual(body["response_format"]["type"], "json_schema")
+        work, formatter = self.requests
+        self.assertNotIn("response_format", work)
+        self.assertTrue(work["tools"])
         self.assertNotIn(
             structured_output_fallback._FORMAT_TOOL_NAME,
-            json.dumps(body.get("tools", [])),
+            json.dumps(work["tools"]),
+        )
+        self.assertEqual(
+            formatter["tool_choice"],
+            {
+                "type": "function",
+                "function": {
+                    "name": structured_output_fallback._FORMAT_TOOL_NAME
+                },
+            },
+        )
+        self.assertEqual(
+            [tool["function"]["name"] for tool in formatter["tools"]],
+            [structured_output_fallback._FORMAT_TOOL_NAME],
         )
 
-    def test_agents_with_tools_keep_the_native_request(self):
+    def test_agents_with_tools_run_a_work_phase_then_a_formatter(self):
         @function_tool
         def lookup_library(name: str) -> str:
             """Look a library up in the catalogue."""
@@ -711,9 +756,13 @@ class DeepSeekFallbackTests(unittest.TestCase):
 
         self._run(tools=[lookup_library])
 
-        body = self._one_request()
-        self.assertEqual(body["response_format"]["type"], "json_schema")
-        self.assertTrue(body["tools"])
+        work, formatter = self.requests
+        # The work phase asks for no structured output at all, so the provider
+        # cannot skip the tool call the way it does under a response format.
+        self.assertNotIn("response_format", work)
+        self.assertTrue(work["tools"])
+        self.assertEqual(formatter["response_format"], {"type": "json_object"})
+        self.assertNotIn("tools", formatter)
 
     def test_recursive_output_schema_fails_before_the_request(self):
         with self.assertRaisesRegex(ValueError, "recursive"):
@@ -895,6 +944,9 @@ class MiniMaxFallbackTests(unittest.TestCase):
         # Ordinary assistant text: what the provider sends instead of a call.
         self.reply: str | None = None
         self.refusal: str | None = None
+        # Assistant messages the provider returns, one per request. Empty means
+        # every request is answered with the canned ``self.reply`` message.
+        self.script: list[dict[str, object]] = []
         self._clients: list[AsyncOpenAI] = []
 
         self._previous_trace_provider = tracing_setup.GLOBAL_TRACE_PROVIDER
@@ -928,14 +980,17 @@ class MiniMaxFallbackTests(unittest.TestCase):
 
     def _handle_request(self, request: httpx2.Request) -> httpx2.Response:
         self.requests.append(json.loads(request.content))
-        message: dict[str, object] = {
-            "role": "assistant",
-            "content": self.reply,
-        }
-        if self.refusal is not None:
-            message["refusal"] = self.refusal
-        if self.tool_calls is not None:
-            message["tool_calls"] = self.tool_calls
+        if self.script:
+            message = dict(self.script.pop(0))
+        else:
+            message: dict[str, object] = {
+                "role": "assistant",
+                "content": self.reply,
+            }
+            if self.refusal is not None:
+                message["refusal"] = self.refusal
+            if self.tool_calls is not None:
+                message["tool_calls"] = self.tool_calls
         return httpx2.Response(
             200,
             headers={"x-request-id": "req-minimax"},
@@ -1168,37 +1223,657 @@ class MiniMaxFallbackTests(unittest.TestCase):
         self.assertNotIn("tools", body)
         self.assertNotIn("response_format", body)
 
-    def test_agents_with_tools_keep_the_native_request(self):
-        self.tool_calls = None
-        self.reply = self.arguments
-
+    def test_agents_with_tools_run_a_work_phase_then_a_formatter(self):
         @function_tool
         def lookup_library(name: str) -> str:
             """Look a library up in the catalogue."""
             return "found"
 
+        self.script = [
+            {"role": "assistant", "content": "Found httpx2."},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [self._call(self.arguments)],
+            },
+        ]
+
         self._run(tools=[lookup_library])
 
-        body = self._one_request()
-        self.assertEqual(body["response_format"]["type"], "json_schema")
-        self.assertNotIn(
-            structured_output_fallback._FORMAT_TOOL_NAME,
-            json.dumps(body["tools"]),
+        work, formatter = self.requests
+        self.assertNotIn("response_format", work)
+        self.assertEqual(
+            [tool["function"]["name"] for tool in work["tools"]],
+            ["lookup_library"],
+        )
+        self.assertEqual(
+            [tool["function"]["name"] for tool in formatter["tools"]],
+            [structured_output_fallback._FORMAT_TOOL_NAME],
         )
 
-    def test_agents_with_handoffs_keep_the_native_request(self):
-        self.tool_calls = None
-        self.reply = self.arguments
+    def test_agents_with_handoffs_run_a_work_phase_then_a_formatter(self):
         specialist = Agent(name="specialist", model=self._model())
+
+        self.script = [
+            {"role": "assistant", "content": "Handing over."},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [self._call(self.arguments)],
+            },
+        ]
 
         self._run(handoffs=[specialist])
 
-        body = self._one_request()
-        self.assertEqual(body["response_format"]["type"], "json_schema")
-        self.assertNotIn(
-            structured_output_fallback._FORMAT_TOOL_NAME,
-            json.dumps(body["tools"]),
+        work, formatter = self.requests
+        self.assertNotIn("response_format", work)
+        self.assertEqual(
+            [tool["function"]["name"] for tool in work["tools"]],
+            ["transfer_to_specialist"],
         )
+        # A handoff is a tool in this phase only: the formatter must not be
+        # able to hand the turn over.
+        self.assertEqual(
+            [tool["function"]["name"] for tool in formatter["tools"]],
+            [structured_output_fallback._FORMAT_TOOL_NAME],
+        )
+
+
+# The request IDs the two-phase mock provider reports, one per physical call.
+_REQUEST_IDS = {1: "req-work", 2: "req-format"}
+
+
+class TwoPhaseFallbackTests(unittest.TestCase):
+    """Tool-, MCP- and handoff-bearing typed agents under either fallback mode.
+
+    A typed request that also carries tools or handoffs is split in two: the
+    work phase runs the agent's own tools, and only a terminal assistant answer
+    is formatted in a second, tool-less request. These tests drive both phases
+    at the HTTP level, so they prove what each phase actually puts on the wire
+    and that nothing the runner owns is rewritten on the way through.
+    """
+
+    def setUp(self) -> None:
+        self.requests: list[dict[str, object]] = []
+        # One assistant message per request, in order.
+        self.script: list[dict[str, object]] = []
+        self.arguments = json.dumps(
+            {
+                "topic": "structured output",
+                "lead_step": {
+                    "title": "compare providers",
+                    "estimated_minutes": 30,
+                },
+                "status": "draft",
+                "risks": ["provider drift"],
+            }
+        )
+        self._clients: list[AsyncOpenAI] = []
+
+        self._previous_trace_provider = tracing_setup.GLOBAL_TRACE_PROVIDER
+        tracing_setup.GLOBAL_TRACE_PROVIDER = None
+        set_tracing_disabled(True)
+
+    def tearDown(self) -> None:
+        tracing_setup.GLOBAL_TRACE_PROVIDER = self._previous_trace_provider
+        asyncio.run(self._close_clients())
+
+    async def _close_clients(self) -> None:
+        for client in self._clients:
+            await client.close()
+
+    # --- fixtures ---------------------------------------------------------
+
+    def _call(
+        self, name: str, arguments: str, call_id: str = "call_1"
+    ) -> dict[str, object]:
+        """One Chat Completions tool call, in the provider's wire shape."""
+        return {
+            "id": call_id,
+            "type": "function",
+            "function": {"name": name, "arguments": arguments},
+        }
+
+    def _text(self, content: str) -> dict[str, object]:
+        return {"role": "assistant", "content": content}
+
+    def _handle_request(self, request: httpx2.Request) -> httpx2.Response:
+        self.requests.append(json.loads(request.content))
+        # Distinct token counts and request IDs per call, so the aggregated
+        # usage can be checked against the two individual calls rather than
+        # against a total that one call could also produce.
+        index = len(self.requests)
+        return httpx2.Response(
+            200,
+            headers={"x-request-id": _REQUEST_IDS.get(index, f"req-{index}")},
+            json={
+                "id": "chatcmpl-test",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "deepseek-chat",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": self.script.pop(0),
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 10 + index,
+                    "completion_tokens": 6 + index,
+                    "total_tokens": 16 + 2 * index,
+                    "prompt_tokens_details": {"cached_tokens": index},
+                    "completion_tokens_details": {"reasoning_tokens": index + 1},
+                },
+            },
+        )
+
+    def _model(self, mode: str = "deepseek_json", max_tokens: int | None = 2048):
+        client = AsyncOpenAI(
+            api_key="test-key",
+            base_url=_BASE_URL,
+            http_client=httpx2.AsyncClient(
+                transport=httpx2.MockTransport(self._handle_request)
+            ),
+        )
+        self._clients.append(client)
+        return structured_output_fallback.FallbackChatCompletionsModel(
+            model="deepseek-chat",
+            openai_client=client,
+            mode=mode,
+            fallback_max_tokens=max_tokens,
+        )
+
+    def _schema(self) -> AgentOutputSchema:
+        return AgentOutputSchema(ResearchPlanModel, strict_json_schema=True)
+
+    def _tool(self) -> FunctionTool:
+        @function_tool
+        def lookup_library(name: str) -> str:
+            """Look a library up in the catalogue."""
+            return "found"
+
+        return lookup_library
+
+    def _mcp_tool(self) -> FunctionTool:
+        """A tool as an MCP server's tool reaches the model.
+
+        ``MCPUtil.to_function_tool`` converts an MCP tool into an ordinary
+        ``FunctionTool``, so on the wire it is indistinguishable from a local
+        one; what makes it an MCP call is the runner routing the resulting call
+        back to its server. Preserving the call is therefore preserving MCP.
+        """
+
+        async def invoke(context: Any, arguments: str) -> str:
+            return "document: structured output"
+
+        return FunctionTool(
+            name="search_docs",
+            description="Search the documentation server for a query.",
+            params_json_schema={
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+                "additionalProperties": False,
+            },
+            on_invoke_tool=invoke,
+            strict_json_schema=False,
+        )
+
+    def _handoff(self):
+        return handoff(Agent(name="specialist"))
+
+    def _get(
+        self,
+        *,
+        mode: str = "deepseek_json",
+        tools: tuple = (),
+        handoffs: tuple = (),
+        input: str | list = "Plan some research.",
+        model_settings: ModelSettings | None = None,
+    ):
+        return asyncio.run(
+            self._model(mode).get_response(
+                "Plan the research.",
+                input,
+                ModelSettings() if model_settings is None else model_settings,
+                list(tools),
+                self._schema(),
+                list(handoffs),
+                ModelTracing.DISABLED,
+            )
+        )
+
+    def _calls(self, response) -> list[ResponseFunctionToolCall]:
+        return [
+            item
+            for item in response.output
+            if isinstance(item, ResponseFunctionToolCall)
+        ]
+
+    def _tool_names(self, body: dict[str, object]) -> list[str]:
+        return [tool["function"]["name"] for tool in body.get("tools", [])]
+
+    # --- phase one: the work phase ---------------------------------------
+
+    def test_work_phase_returns_the_application_tool_call_unchanged(self):
+        self.script = [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    self._call(
+                        "lookup_library", '{"name": "httpx2"}', "call_library"
+                    )
+                ],
+            }
+        ]
+
+        response = self._get(tools=[self._tool()])
+
+        self.assertEqual(len(self.requests), 1, "no formatting call yet")
+        body = self.requests[0]
+        self.assertNotIn("response_format", body)
+        self.assertEqual(self._tool_names(body), ["lookup_library"])
+        self.assertNotIn(
+            structured_output_fallback._FORMAT_TOOL_NAME, json.dumps(body)
+        )
+
+        calls = self._calls(response)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].name, "lookup_library")
+        self.assertEqual(calls[0].arguments, '{"name": "httpx2"}')
+        self.assertEqual(calls[0].call_id, "call_library")
+
+    def test_mcp_tool_call_is_returned_unchanged(self):
+        self.script = [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    self._call(
+                        "search_docs",
+                        '{"query": "structured output"}',
+                        "call_mcp",
+                    )
+                ],
+            }
+        ]
+
+        response = self._get(tools=[self._mcp_tool()])
+
+        self.assertEqual(len(self.requests), 1, "no formatting call yet")
+        self.assertEqual(self._tool_names(self.requests[0]), ["search_docs"])
+
+        calls = self._calls(response)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].name, "search_docs")
+        self.assertEqual(calls[0].arguments, '{"query": "structured output"}')
+        # The correlation the runner needs to route the call back to its
+        # server is the call id, so it has to survive untouched.
+        self.assertEqual(calls[0].call_id, "call_mcp")
+
+    def test_handoff_call_is_returned_unchanged(self):
+        self.script = [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [self._call("transfer_to_specialist", "{}")],
+            }
+        ]
+
+        response = self._get(handoffs=[self._handoff()])
+
+        self.assertEqual(len(self.requests), 1, "no formatting call yet")
+        self.assertEqual(
+            self._tool_names(self.requests[0]), ["transfer_to_specialist"]
+        )
+
+        calls = self._calls(response)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].name, "transfer_to_specialist")
+
+    def test_refusal_in_the_work_phase_is_returned_unchanged(self):
+        self.script = [
+            {
+                "role": "assistant",
+                "content": None,
+                "refusal": "I cannot help with that.",
+            }
+        ]
+
+        response = self._get(tools=[self._tool()])
+
+        self.assertEqual(len(self.requests), 1, "a refusal is not formatted")
+        refusals = [
+            part
+            for item in response.output
+            if isinstance(item, ResponseOutputMessage)
+            for part in item.content
+            if isinstance(part, ResponseOutputRefusal)
+        ]
+        self.assertEqual(
+            [part.refusal for part in refusals], ["I cannot help with that."]
+        )
+
+    def test_work_phase_without_text_calls_or_refusal_fails_visibly(self):
+        self.script = [self._text("")]
+
+        with self.assertRaisesRegex(ModelBehaviorError, "nothing to format"):
+            self._get(tools=[self._tool()])
+
+        self.assertEqual(len(self.requests), 1, "no formatting call was made")
+
+    # --- phase two: the formatting phase ----------------------------------
+
+    def test_formatting_runs_only_after_a_terminal_text_response(self):
+        self.script = [
+            self._text("Found httpx2 in the catalogue."),
+            self._text(self.arguments),
+        ]
+
+        response = self._get(tools=[self._tool()])
+
+        self.assertEqual(len(self.requests), 2)
+        work, formatter = self.requests
+        self.assertNotIn("response_format", work)
+        self.assertTrue(work["tools"])
+        self.assertEqual(formatter["response_format"], {"type": "json_object"})
+        self.assertNotIn("tools", formatter)
+
+        # The formatter sees the turn that produced the answer, not only the
+        # answer: history, the work result, then one formatting instruction.
+        self.assertEqual(
+            [message["role"] for message in formatter["messages"]],
+            ["system", "user", "assistant", "user"],
+        )
+        self.assertEqual(
+            formatter["messages"][2]["content"],
+            "Found httpx2 in the catalogue.",
+        )
+
+        self.assertEqual(len(response.output), 1)
+        message = response.output[0]
+        self.assertIsInstance(message, ResponseOutputMessage)
+        self.assertEqual(
+            json.loads(message.content[0].text), json.loads(self.arguments)
+        )
+
+    def test_minimax_mode_formats_with_only_the_synthetic_function(self):
+        self.script = [
+            self._text("Found httpx2 in the catalogue."),
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [self._call("emit_typed_output", self.arguments)],
+            },
+        ]
+
+        response = self._get(mode="minimax_function", tools=[self._tool()])
+
+        work, formatter = self.requests
+        self.assertNotIn("response_format", work)
+        self.assertEqual(self._tool_names(work), ["lookup_library"])
+        self.assertEqual(
+            formatter["tool_choice"],
+            {
+                "type": "function",
+                "function": {"name": "emit_typed_output"},
+            },
+        )
+        self.assertEqual(self._tool_names(formatter), ["emit_typed_output"])
+        self.assertEqual(
+            json.loads(response.output[0].content[0].text),
+            json.loads(self.arguments),
+        )
+
+    def test_handoffs_are_never_sent_to_the_formatter(self):
+        self.script = [
+            self._text("Handing over to a specialist."),
+            self._text(self.arguments),
+        ]
+
+        self._get(handoffs=[self._handoff()])
+
+        work, formatter = self.requests
+        self.assertEqual(self._tool_names(work), ["transfer_to_specialist"])
+        self.assertNotIn("tools", formatter)
+        self.assertNotIn("transfer_to_specialist", json.dumps(formatter))
+
+    def test_string_input_is_preserved_as_a_user_message(self):
+        self.script = [self._text("Found httpx2."), self._text(self.arguments)]
+
+        self._get(tools=[self._tool()], input="Plan some research.")
+
+        formatter = self.requests[1]
+        self.assertEqual(formatter["messages"][1]["role"], "user")
+        self.assertEqual(
+            formatter["messages"][1]["content"], "Plan some research."
+        )
+
+    def test_list_input_history_is_preserved(self):
+        history = [
+            {"role": "user", "content": "Plan some research."},
+            {"role": "assistant", "content": "Which area?"},
+            {"role": "user", "content": "Structured output."},
+        ]
+        self.script = [self._text("Found httpx2."), self._text(self.arguments)]
+
+        self._get(tools=[self._tool()], input=history)
+
+        formatter = self.requests[1]
+        self.assertEqual(
+            [message["content"] for message in formatter["messages"][1:4]],
+            ["Plan some research.", "Which area?", "Structured output."],
+        )
+
+    def test_formatter_output_that_is_not_the_schema_fails_visibly(self):
+        self.script = [
+            self._text("Found httpx2."),
+            self._text("Here is the plan instead."),
+        ]
+
+        with self.assertRaises(ModelBehaviorError):
+            self._get(tools=[self._tool()])
+
+        self.assertEqual(len(self.requests), 2, "both phases were attempted")
+
+    # --- accounting --------------------------------------------------------
+
+    def test_usage_is_aggregated_across_both_phase_requests(self):
+        self.script = [self._text("Found httpx2."), self._text(self.arguments)]
+
+        response = self._get(
+            tools=[self._tool()],
+            model_settings=ModelSettings(preserve_raw_usage=True),
+        )
+
+        usage = response.usage
+        self.assertEqual(usage.requests, 2)
+        self.assertEqual(usage.input_tokens, 11 + 12)
+        self.assertEqual(usage.output_tokens, 7 + 8)
+        self.assertEqual(usage.total_tokens, 18 + 20)
+        self.assertEqual(usage.input_tokens_details.cached_tokens, 1 + 2)
+        self.assertEqual(usage.output_tokens_details.reasoning_tokens, 2 + 3)
+        self.assertEqual(len(usage.request_usage_entries), 2)
+        # One response cannot carry the request id or raw usage payload of two
+        # physical provider calls, so neither is reported as if it were both.
+        self.assertIsNone(response.request_id)
+        self.assertIsNone(response.raw_usage)
+
+    def test_two_phase_run_logs_only_safe_metadata(self):
+        self.script = [self._text("Found httpx2."), self._text(self.arguments)]
+
+        with self.assertLogs("openai.agents", level="DEBUG") as logs:
+            self._get(tools=[self._tool()])
+
+        records = [
+            record
+            for record in logs.records
+            if getattr(record, "phase_count", None) == 2
+        ]
+        self.assertEqual(len(records), 1)
+        record = records[0]
+        self.assertEqual(record.fallback_mode, "deepseek_json")
+        self.assertEqual(record.work_request_id, "req-work")
+        self.assertEqual(record.format_request_id, "req-format")
+
+        # The record is the adapter's own, so only its message is under test:
+        # the SDK's surrounding debug logs do contain model data.
+        rendered = record.getMessage()
+        for secret in (
+            "Plan some research.",
+            self.arguments,
+            "Found httpx2.",
+            "test-key",
+            "Bearer",
+        ):
+            with self.subTest(secret=secret):
+                self.assertNotIn(secret, rendered)
+
+    # --- the whole run -----------------------------------------------------
+
+    def test_runner_executes_the_tool_then_formats_the_final_answer(self):
+        """The work the runner asked for happens, and only then is it formatted."""
+        self.script = [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    self._call("lookup_library", '{"name": "httpx2"}', "call_1")
+                ],
+            },
+            self._text("Found httpx2 in the catalogue."),
+            self._text(self.arguments),
+        ]
+        agent = Agent(
+            name="planner",
+            instructions="Plan the research.",
+            model=self._model(),
+            output_type=ResearchPlanModel,
+            tools=[self._tool()],
+        )
+
+        result = asyncio.run(Runner.run(agent, "Plan some research."))
+
+        self.assertEqual(result.final_output.topic, "structured output")
+        self.assertEqual(result.final_output.lead_step.estimated_minutes, 30)
+        # One work call that produced the tool call, one that produced the
+        # terminal answer, and one formatting call.
+        self.assertEqual(len(self.requests), 3)
+        self.assertEqual(len(self.requests[0]["tools"]), 1)
+        self.assertNotIn("tools", self.requests[2])
+
+
+class StreamingFallbackTests(unittest.TestCase):
+    """Typed-output streaming is refused before a request is built."""
+
+    def setUp(self) -> None:
+        self.requests: list[dict[str, object]] = []
+        self._clients: list[AsyncOpenAI] = []
+
+        self._previous_trace_provider = tracing_setup.GLOBAL_TRACE_PROVIDER
+        tracing_setup.GLOBAL_TRACE_PROVIDER = None
+        set_tracing_disabled(True)
+
+    def tearDown(self) -> None:
+        tracing_setup.GLOBAL_TRACE_PROVIDER = self._previous_trace_provider
+        asyncio.run(self._close_clients())
+
+    async def _close_clients(self) -> None:
+        for client in self._clients:
+            await client.close()
+
+    def _handle_request(self, request: httpx2.Request) -> httpx2.Response:
+        self.requests.append(json.loads(request.content))
+        chunks = (
+            {
+                "id": "chatcmpl-test",
+                "object": "chat.completion.chunk",
+                "created": 0,
+                "model": "deepseek-chat",
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"role": "assistant", "content": "Here."},
+                        "finish_reason": None,
+                    }
+                ],
+            },
+            {
+                "id": "chatcmpl-test",
+                "object": "chat.completion.chunk",
+                "created": 0,
+                "model": "deepseek-chat",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            },
+        )
+        body = (
+            "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks)
+            + "data: [DONE]\n\n"
+        )
+        return httpx2.Response(
+            200,
+            content=body.encode(),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    def _model(self, mode: str = "deepseek_json"):
+        client = AsyncOpenAI(
+            api_key="test-key",
+            base_url=_BASE_URL,
+            http_client=httpx2.AsyncClient(
+                transport=httpx2.MockTransport(self._handle_request)
+            ),
+        )
+        self._clients.append(client)
+        return structured_output_fallback.FallbackChatCompletionsModel(
+            model="deepseek-chat",
+            openai_client=client,
+            mode=mode,
+            fallback_max_tokens=2048,
+        )
+
+    def test_typed_stream_is_rejected_before_any_request(self):
+        for mode in ("deepseek_json", "minimax_function"):
+            with self.subTest(mode=mode):
+                model = self._model(mode)
+
+                with self.assertRaisesRegex(ModelBehaviorError, "stream"):
+                    model.stream_response(
+                        "Plan the research.",
+                        "Plan some research.",
+                        ModelSettings(),
+                        [],
+                        AgentOutputSchema(ResearchPlanModel, strict_json_schema=True),
+                        [],
+                        ModelTracing.DISABLED,
+                    )
+
+                self.assertEqual(self.requests, [], "no request may be sent")
+
+    def test_plain_text_stream_delegates_unchanged(self):
+        model = self._model()
+
+        events = asyncio.run(
+            self._consume(
+                model.stream_response(
+                    "Plan the research.",
+                    "Plan some research.",
+                    ModelSettings(),
+                    [],
+                    None,
+                    [],
+                    ModelTracing.DISABLED,
+                )
+            )
+        )
+
+        self.assertEqual(len(self.requests), 1)
+        self.assertTrue(events)
+
+    async def _consume(self, stream) -> list[object]:
+        return [event async for event in stream]
 
 
 if __name__ == "__main__":

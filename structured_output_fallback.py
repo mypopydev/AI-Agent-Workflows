@@ -14,30 +14,39 @@ Two provider protocols are selected by :func:`install`, and both are
 implemented here: ``deepseek_json`` asks for JSON mode in the request, and
 ``minimax_function`` routes the typed output through a synthetic function call
 instead of a JSON Schema response format.
+
+A typed request that also carries tools, MCP tools, or handoffs is served in
+two phases instead: the work phase runs the agent's own tools, and only a
+terminal assistant answer is formatted by a second, tool-less request.
 """
 
 import dataclasses
 import json
 import uuid
 import weakref
+from collections.abc import AsyncIterator
 from typing import Any
 
 from agents.agent_output import AgentOutputSchemaBase
 from agents.exceptions import ModelBehaviorError
 from agents.handoffs import Handoff
 from agents.items import (
+    ItemHelpers,
     ResponseFunctionToolCall,
     ResponseOutputMessage,
     ResponseOutputRefusal,
     ResponseOutputText,
     TResponseInputItem,
+    TResponseStreamEvent,
 )
+from agents.logger import logger
 from agents.model_settings import ModelSettings
 from agents.models.interface import ModelResponse, ModelTracing
 from agents.models.openai_chatcompletions import OpenAIChatCompletionsModel
 from agents.models.openai_provider import OpenAIProvider
 from agents.tool import FunctionTool, Tool
 from agents.tool_context import ToolContext
+from agents.usage import Usage
 from openai.types.responses.response_prompt_param import ResponsePromptParam
 
 # Captured at import time, before any wrapper replaces the factory.
@@ -51,6 +60,8 @@ _DEEPSEEK_JSON_MODE = "deepseek_json"
 # ``response_format``, so the typed output is collected as a function call.
 _MINIMAX_FUNCTION_MODE = "minimax_function"
 
+_FALLBACK_MODES = (_DEEPSEEK_JSON_MODE, _MINIMAX_FUNCTION_MODE)
+
 # Reserved for the adapter's own formatting call. An application tool must
 # never be given this name: the two would be indistinguishable in a response.
 _FORMAT_TOOL_NAME = "emit_typed_output"
@@ -59,6 +70,15 @@ _FORMAT_TOOL_NAME = "emit_typed_output"
 # declared example schemas, and small enough that an example stays readable in
 # a prompt. It bounds size, not recursion: cycles are detected separately.
 _MAX_EXAMPLE_NODES = 256
+
+# The instruction that closes a formatting-phase input. The schema itself
+# travels through the selected protocol - a system instruction for DeepSeek,
+# the formatting function's parameters for MiniMax - so this only has to say
+# what to do with the answer above it.
+_FORMAT_REQUEST_TEXT = (
+    "Convert the answer above into the final JSON output for the required "
+    "schema. Return JSON only: no prose, no Markdown fences, no extra keys."
+)
 
 _mode: str | None = None
 _fallback_max_tokens: int | None = None
@@ -117,23 +137,15 @@ class FallbackChatCompletionsModel(OpenAIChatCompletionsModel):
     ) -> ModelResponse:
         """Rewrite typed-output requests the selected mode covers.
 
-        Both protocols apply only to a typed request that is not competing
-        with application tools or handoffs; everything else is left to the SDK.
-        The original ``output_schema`` is always passed through on the DeepSeek
-        path, so the SDK still parses and validates the final content against
-        it; MiniMax validates the arguments here and hands the SDK plain text.
+        A typed request with no application tools or handoffs is a single call
+        under the selected protocol. One that carries tools or handoffs is
+        split: the tools run first, and only the terminal answer is formatted.
         """
-        if self._uses_deepseek_json(output_schema, tools, handoffs):
-            # The budget is a configuration problem, so it is checked before a
-            # schema the adapter cannot describe.
-            settings = self._json_mode_settings(model_settings)
-            instructions = _json_instructions(output_schema) + (
-                system_instructions or ""
-            )
-            response = await self._sdk_get_response(
-                instructions,
+        if self._uses_two_phase(output_schema, tools, handoffs):
+            return await self._two_phase_response(
+                system_instructions,
                 input,
-                settings,
+                model_settings,
                 tools,
                 output_schema,
                 handoffs,
@@ -142,26 +154,20 @@ class FallbackChatCompletionsModel(OpenAIChatCompletionsModel):
                 conversation_id,
                 prompt,
             )
-            _reject_silent_empty_output(response)
-            return response
 
-        if self._uses_minimax_function(output_schema, tools, handoffs):
-            # The schema travels as the function's parameter schema instead of
-            # a response format, so the SDK is given no output schema at all:
-            # this adapter validates the arguments against the real one.
-            response = await self._sdk_get_response(
+        if self._uses_deepseek_json(
+            output_schema, tools, handoffs
+        ) or self._uses_minimax_function(output_schema, tools, handoffs):
+            return await self._typed_single_call(
                 system_instructions,
                 input,
-                self._function_call_settings(model_settings),
-                [_format_tool(output_schema)],
-                None,
-                handoffs,
+                model_settings,
+                output_schema,
                 tracing,
                 previous_response_id,
                 conversation_id,
                 prompt,
             )
-            return _function_call_to_text(response, output_schema)
 
         return await self._sdk_get_response(
             system_instructions,
@@ -174,6 +180,208 @@ class FallbackChatCompletionsModel(OpenAIChatCompletionsModel):
             previous_response_id,
             conversation_id,
             prompt,
+        )
+
+    def stream_response(
+        self,
+        system_instructions: str | None,
+        input: str | list[TResponseInputItem],
+        model_settings: ModelSettings,
+        tools: list[Tool],
+        output_schema: AgentOutputSchemaBase | None,
+        handoffs: list[Handoff],
+        tracing: ModelTracing,
+        previous_response_id: str | None = None,
+        conversation_id: str | None = None,
+        prompt: ResponsePromptParam | None = None,
+    ) -> AsyncIterator[TResponseStreamEvent]:
+        """Refuse to stream a typed output under either fallback mode.
+
+        Both protocols produce the typed output only after the model turn, and
+        a tool-bearing typed agent needs two turns before there is anything to
+        validate, so neither can be served by a stream that emits as it goes.
+        The refusal is raised here rather than inside the generator body so it
+        surfaces before a request is built, instead of as an empty stream.
+        """
+        if self._fallback_mode in _FALLBACK_MODES and _is_typed_output(
+            output_schema
+        ):
+            raise ModelBehaviorError(
+                f"Structured output fallback mode {self._fallback_mode!r} does "
+                "not support streamed runs: the fallback validates the typed "
+                "output after the model turn, which a stream cannot provide. "
+                "Use Runner.run for typed agents, or unset "
+                "AGENT_STRUCTURED_OUTPUT_MODE for streamed runs."
+            )
+
+        return super().stream_response(
+            system_instructions,
+            input,
+            model_settings,
+            tools,
+            output_schema,
+            handoffs,
+            tracing,
+            previous_response_id=previous_response_id,
+            conversation_id=conversation_id,
+            prompt=prompt,
+        )
+
+    async def _typed_single_call(
+        self,
+        system_instructions,
+        input,
+        model_settings,
+        output_schema,
+        tracing,
+        previous_response_id,
+        conversation_id,
+        prompt,
+    ) -> ModelResponse:
+        """One typed call with no application tools, MCP tools, or handoffs.
+
+        This is the whole of each protocol, and it is the only path the
+        formatting phase uses, so the two cannot drift apart. The original
+        ``output_schema`` is passed through on the DeepSeek path, so the SDK
+        still parses and validates the final content against it; MiniMax
+        validates the arguments here and hands the SDK plain text.
+        """
+        if self._fallback_mode == _DEEPSEEK_JSON_MODE:
+            # The budget is a configuration problem, so it is checked before a
+            # schema the adapter cannot describe.
+            settings = self._json_mode_settings(model_settings)
+            instructions = _json_instructions(output_schema) + (
+                system_instructions or ""
+            )
+            response = await self._sdk_get_response(
+                instructions,
+                input,
+                settings,
+                [],
+                output_schema,
+                [],
+                tracing,
+                previous_response_id,
+                conversation_id,
+                prompt,
+            )
+            _reject_silent_empty_output(response)
+            return response
+
+        # The remaining mode is MiniMax: the schema travels as the function's
+        # parameter schema instead of a response format, so the SDK is given no
+        # output schema at all.
+        response = await self._sdk_get_response(
+            system_instructions,
+            input,
+            self._function_call_settings(model_settings),
+            [_format_tool(output_schema)],
+            None,
+            [],
+            tracing,
+            previous_response_id,
+            conversation_id,
+            prompt,
+        )
+        return _function_call_to_text(response, output_schema)
+
+    async def _two_phase_response(
+        self,
+        system_instructions,
+        input,
+        model_settings,
+        tools,
+        output_schema,
+        handoffs,
+        tracing,
+        previous_response_id,
+        conversation_id,
+        prompt,
+    ) -> ModelResponse:
+        """Run the agent's own tools, then format only a terminal answer.
+
+        Asking one turn for both a tool call and a structured output is the
+        combination the design rules out: the providers behind both modes have
+        been observed skipping the tool call when a structured output
+        constraint is present. So the work phase asks for no output schema at
+        all, and anything the runner still has to execute is handed back
+        untouched for its own loop to run.
+        """
+        work = await self._sdk_get_response(
+            system_instructions,
+            input,
+            model_settings,
+            tools,
+            None,
+            handoffs,
+            tracing,
+            previous_response_id,
+            conversation_id,
+            prompt,
+        )
+        if any(isinstance(item, ResponseFunctionToolCall) for item in work.output):
+            return work
+        if _has_refusal(work):
+            return work
+
+        message = next(
+            (
+                item
+                for item in reversed(work.output)
+                if isinstance(item, ResponseOutputMessage)
+            ),
+            None,
+        )
+        text = ItemHelpers.extract_last_content(message) if message is not None else ""
+        if not text:
+            raise ModelBehaviorError(
+                "The structured output fallback work phase returned a response "
+                "with no tool call, handoff, refusal, or assistant text, so "
+                "there is nothing to format."
+            )
+
+        formatted = await self._format_without_application_tools(
+            system_instructions,
+            append_assistant_text_and_format_request(input, text, output_schema),
+            model_settings,
+            output_schema,
+            tracing,
+        )
+        response = _aggregate_two_responses(work, formatted, output_schema)
+        logger.debug(
+            "Structured output fallback used two provider requests",
+            extra={
+                "fallback_mode": self._fallback_mode,
+                "phase_count": 2,
+                "work_request_id": work.request_id,
+                "format_request_id": formatted.request_id,
+            },
+        )
+        return response
+
+    async def _format_without_application_tools(
+        self,
+        system_instructions,
+        format_input,
+        model_settings,
+        output_schema,
+        tracing,
+    ) -> ModelResponse:
+        """Format the work answer with a typed call that owns no tools.
+
+        The formatter is the single-call protocol, never the two-phase one: it
+        is invoked directly, so a ``tools`` list cannot reach it and a
+        formatting call cannot recurse into another work phase.
+        """
+        return await self._typed_single_call(
+            system_instructions,
+            format_input,
+            model_settings,
+            output_schema,
+            tracing,
+            None,
+            None,
+            None,
         )
 
     async def _sdk_get_response(
@@ -216,6 +424,19 @@ class FallbackChatCompletionsModel(OpenAIChatCompletionsModel):
             and _is_typed_output(output_schema)
             and not tools
             and not handoffs
+        )
+
+    def _uses_two_phase(self, output_schema, tools, handoffs) -> bool:
+        """Whether a typed request has to be split into work and formatting.
+
+        Tools and handoffs are how the runner gets work done, so they win the
+        turn; the typed output is asked for afterwards, in a request of its
+        own.
+        """
+        return (
+            self._fallback_mode in _FALLBACK_MODES
+            and _is_typed_output(output_schema)
+            and bool(tools or handoffs)
         )
 
     def _json_mode_settings(self, model_settings: ModelSettings) -> ModelSettings:
@@ -268,6 +489,93 @@ class FallbackChatCompletionsModel(OpenAIChatCompletionsModel):
 
 def _is_typed_output(output_schema: AgentOutputSchemaBase | None) -> bool:
     return output_schema is not None and not output_schema.is_plain_text()
+
+
+def _has_refusal(response: ModelResponse) -> bool:
+    """Whether the provider answered with a refusal instead of output.
+
+    A refusal is a terminal answer, like a tool call: formatting it would
+    invent the output the provider declined to give, so it goes back to the
+    SDK's own refusal handling. It is a content part of a message, not an
+    output item of its own.
+    """
+    for item in response.output:
+        if isinstance(item, ResponseOutputRefusal):
+            return True
+        if isinstance(item, ResponseOutputMessage) and any(
+            isinstance(part, ResponseOutputRefusal) for part in item.content
+        ):
+            return True
+    return False
+
+
+def append_assistant_text_and_format_request(
+    input: str | list[TResponseInputItem],
+    text: str,
+    output_schema: AgentOutputSchemaBase,
+) -> list[TResponseInputItem]:
+    """Build the formatting-phase input from the original one.
+
+    A string input becomes a one-message list, because the work answer has to
+    be appended as the assistant turn that follows it. A list input is copied
+    rather than extended: the caller's history is the runner's, and the
+    formatting request is a different turn on top of it.
+
+    ``output_schema`` is part of the interface the two phases are specified
+    with, and no phase-A tool call travels as a callable tool; the schema
+    itself is described by the selected protocol, not by this instruction, so
+    it is not repeated here.
+    """
+    messages: list[TResponseInputItem] = (
+        [{"role": "user", "content": input}] if isinstance(input, str) else list(input)
+    )
+    messages.append({"role": "assistant", "content": text})
+    messages.append({"role": "user", "content": _FORMAT_REQUEST_TEXT})
+    return messages
+
+
+def _aggregate_two_responses(
+    work: ModelResponse,
+    formatted: ModelResponse,
+    output_schema: AgentOutputSchemaBase,
+) -> ModelResponse:
+    """Return one typed assistant message, accounting for both provider calls.
+
+    The formatter's text is validated here, before it leaves the adapter, so a
+    two-phase run cannot end in an unvalidated output: a successful HTTP
+    response is not itself a typed-output pass.
+
+    ``request_id`` and ``raw_usage`` describe one provider payload each, so
+    reporting either would present one of the two calls as if it were both;
+    both are dropped and the per-request breakdown stays in
+    ``usage.request_usage_entries``.
+    """
+    text = _final_text(formatted)
+    if not text:
+        raise ModelBehaviorError(
+            "The structured output fallback formatting phase returned no "
+            "assistant text, so there is no typed output to validate."
+        )
+    output_schema.validate_json(text)
+
+    usage = Usage()
+    usage.add(work.usage)
+    usage.add(formatted.usage)
+    return ModelResponse(
+        output=formatted.output,
+        usage=usage,
+        response_id=None,
+        request_id=None,
+        raw_usage=None,
+    )
+
+
+def _final_text(response: ModelResponse) -> str:
+    """The last assistant text a response carries."""
+    for item in reversed(response.output):
+        if isinstance(item, ResponseOutputMessage):
+            return ItemHelpers.extract_last_text(item) or ""
+    return ""
 
 
 def _reject_silent_empty_output(response: ModelResponse) -> None:
