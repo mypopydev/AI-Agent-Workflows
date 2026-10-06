@@ -36,9 +36,10 @@ _original_get_model = OpenAIProvider.get_model
 # documented failure mode is a truncated or empty completion.
 _DEEPSEEK_JSON_MODE = "deepseek_json"
 
-# Enough for the nested schemas the examples declare, and small enough that a
-# schema that only repeats itself is reported instead of walked forever.
-_MAX_EXAMPLE_DEPTH = 8
+# How many schema nodes one example traversal may expand. Generous next to the
+# declared example schemas, and small enough that an example stays readable in
+# a prompt. It bounds size, not recursion: cycles are detected separately.
+_MAX_EXAMPLE_NODES = 256
 
 _mode: str | None = None
 _fallback_max_tokens: int | None = None
@@ -216,23 +217,69 @@ def _json_instructions(output_schema: AgentOutputSchemaBase) -> str:
     )
 
 
+class _NodeBudget:
+    """Caps how many schema nodes one example traversal may expand.
+
+    A schema can be acyclic and still explode: twelve ``$defs`` that each
+    reference the next one twice describe a four-thousand-node example. Nothing
+    about that is recursive, so it gets its own error rather than the
+    recursion one.
+    """
+
+    def __init__(self, limit: int = _MAX_EXAMPLE_NODES) -> None:
+        self.remaining = limit
+
+    def spend(self) -> None:
+        self.remaining -= 1
+        if self.remaining < 0:
+            raise ValueError(
+                "Cannot build a JSON example: the output schema needs more "
+                f"than {_MAX_EXAMPLE_NODES} nodes to illustrate, so it is too "
+                "deep or too wide for a prompt example."
+            )
+
+
 def _json_schema_example(schema: dict[str, object]) -> object:
     """Build a representative JSON value for ``schema``.
 
     The result is any JSON value, not only an object: a typed output may be a
     list or a scalar. Anything the traversal cannot represent - a remote
-    ``$ref``, a schema with no usable type, a cycle - raises instead of
-    producing an example that would mislead the model.
+    ``$ref``, a schema with no usable type, a cycle, a schema too large to
+    illustrate - raises instead of producing an example that would mislead the
+    model.
     """
     return _example_for(schema, schema)
 
 
-def _example_for(schema: dict[str, object], root: dict[str, object], depth: int = 0):
-    if depth > _MAX_EXAMPLE_DEPTH:
-        raise ValueError("Cannot build a JSON example for recursive output schema")
+def _example_for(
+    schema: dict[str, object],
+    root: dict[str, object],
+    active: tuple[str, ...] = (),
+    budget: _NodeBudget | None = None,
+):
+    """Build an example for ``schema``.
+
+    ``active`` holds the ``$ref`` values whose expansion is in progress right
+    now, so a reference that leads back into itself is reported as recursion.
+    Depth is not a proxy for that: a chain of distinct references is deep but
+    finite, and calling it recursive would refuse schemas that are perfectly
+    describable. ``budget`` bounds total size instead, which depth cannot: a
+    schema that references the next definition twice is acyclic and still
+    doubles at every level.
+    """
+    budget = _NodeBudget() if budget is None else budget
+    budget.spend()
 
     if "$ref" in schema:
-        return _example_for(_resolve_ref(schema["$ref"], root), root, depth + 1)
+        ref = schema["$ref"]
+        if ref in active:
+            raise ValueError(
+                f"Cannot build a JSON example: output schema reference {ref!r} "
+                "is recursive, so it has no finite example."
+            )
+        return _example_for(
+            _resolve_ref(ref, root), root, active + (ref,), budget
+        )
     if "const" in schema:
         return schema["const"]
     if "enum" in schema:
@@ -250,7 +297,7 @@ def _example_for(schema: dict[str, object], root: dict[str, object], depth: int 
             ]
             if not branches:
                 return None
-            return _example_for(branches[0], root, depth + 1)
+            return _example_for(branches[0], root, active, budget)
 
     kind = schema.get("type")
     if kind == "object" or "properties" in schema:
@@ -258,12 +305,12 @@ def _example_for(schema: dict[str, object], root: dict[str, object], depth: int 
         # omitting an optional property always does.
         required = set(schema.get("required", []))
         return {
-            name: _example_for(value, root, depth + 1)
+            name: _example_for(value, root, active, budget)
             for name, value in schema.get("properties", {}).items()
             if name in required
         }
     if kind == "array":
-        return [_example_for(schema["items"], root, depth + 1)]
+        return [_example_for(schema["items"], root, active, budget)]
     if kind == "string":
         return ""
     if kind == "integer":

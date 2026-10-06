@@ -32,10 +32,12 @@ import httpx2
 from agents import Agent, Runner, function_tool, set_tracing_disabled
 from agents.agent_output import AgentOutputSchema
 from agents.exceptions import ModelBehaviorError
+from agents.items import ItemHelpers, MessageOutputItem
 from agents.model_settings import ModelSettings
+from agents.models.interface import ModelTracing
 from agents.tracing import setup as tracing_setup
 from openai import AsyncOpenAI
-from pydantic import BaseModel
+from pydantic import BaseModel, create_model
 
 import structured_output_fallback
 from agents.models.openai_chatcompletions import OpenAIChatCompletionsModel
@@ -352,6 +354,65 @@ class RecursiveNodeModel(BaseModel):
 RecursiveNodeModel.model_rebuild()
 
 
+# A nesting depth no declared example schema reaches, but which must still be
+# describable: it is finite, so only a real cycle may be refused.
+_DEEP_LEVELS = 12
+
+
+def _deep_output_type(levels: int = _DEEP_LEVELS):
+    """Build ``levels`` nested Pydantic models; the innermost holds a string."""
+    current = create_model("DeepLeaf", value=(str, ...))
+    for index in range(levels - 1):
+        current = create_model(f"DeepLevel{index}", child=(current, ...))
+    return current
+
+
+def _deep_payload(levels: int = _DEEP_LEVELS) -> dict[str, object]:
+    payload: dict[str, object] = {"value": "bottom"}
+    for _ in range(levels - 1):
+        payload = {"child": payload}
+    return payload
+
+
+def _chain_schema(levels: int) -> dict[str, object]:
+    """A ``$defs`` chain ``levels`` deep, with no reference repeated."""
+    defs: dict[str, object] = {}
+    for level in range(levels):
+        if level == levels - 1:
+            defs[f"L{level}"] = {
+                "type": "object",
+                "properties": {"value": {"type": "string"}},
+                "required": ["value"],
+            }
+        else:
+            defs[f"L{level}"] = {
+                "type": "object",
+                "properties": {"child": {"$ref": f"#/$defs/L{level + 1}"}},
+                "required": ["child"],
+            }
+    return {"$defs": defs, "$ref": "#/$defs/L0"}
+
+
+def _doubling_schema(levels: int) -> dict[str, object]:
+    """An acyclic schema whose example still doubles at every level."""
+    defs: dict[str, object] = {}
+    for level in range(levels):
+        if level == levels - 1:
+            defs[f"D{level}"] = {
+                "type": "object",
+                "properties": {"value": {"type": "string"}},
+                "required": ["value"],
+            }
+        else:
+            next_ref = {"$ref": f"#/$defs/D{level + 1}"}
+            defs[f"D{level}"] = {
+                "type": "object",
+                "properties": {"left": next_ref, "right": next_ref},
+                "required": ["left", "right"],
+            }
+    return {"$defs": defs, "$ref": "#/$defs/D0"}
+
+
 class DeepSeekFallbackTests(unittest.TestCase):
     """The DeepSeek JSON Output adaptation, checked on the serialized request.
 
@@ -555,12 +616,62 @@ class DeepSeekFallbackTests(unittest.TestCase):
         with self.assertRaisesRegex(ModelBehaviorError, "Invalid JSON"):
             self._run()
 
-    def test_empty_completion_fails_visibly(self):
+    def test_truncation_fails_before_schema_validation(self):
+        # finish_reason="length" is the SDK's own guard: it never reaches the
+        # schema, so this only proves the budget exhaustion is still visible.
         self.reply = ""
         self.finish_reason = "length"
 
         with self.assertRaises(ModelBehaviorError):
             self._run()
+
+    def test_empty_json_content_is_not_fabricated_and_fails_validation(self):
+        """The documented DeepSeek failure: HTTP 200, empty JSON content.
+
+        The runner only validates when it found text, so it would loop for ten
+        turns on this response. Validating the text the runner would have read
+        is what makes the failure visible instead, and it only stays visible
+        while the adapter passes the empty completion through unchanged.
+        """
+        self.reply = ""
+        self.finish_reason = "stop"
+        schema = AgentOutputSchema(ResearchPlanModel, strict_json_schema=True)
+
+        response = asyncio.run(
+            self._model().get_response(
+                "Plan the research.",
+                "Plan some research.",
+                ModelSettings(),
+                [],
+                schema,
+                [],
+                ModelTracing.DISABLED,
+            )
+        )
+
+        self.assertEqual(
+            self._one_request()["response_format"], {"type": "json_object"}
+        )
+        text = self._final_output_text(response)
+        self.assertFalse(text, "the adapter must not invent JSON content")
+        with self.assertRaisesRegex(ModelBehaviorError, "Invalid JSON"):
+            schema.validate_json(text or "")
+
+    @staticmethod
+    def _final_output_text(response) -> str | None:
+        """The text the runner would validate, or ``None`` if there is none.
+
+        Mirrors ``agents.run_internal.turn_resolution``: the text is read off
+        the last message item, so no message at all means no text.
+        """
+        messages = [
+            item
+            for item in response.output
+            if isinstance(item, MessageOutputItem)
+        ]
+        if not messages:
+            return None
+        return ItemHelpers.extract_text(messages[-1].raw_item)
 
     # --- requests the adaptation must leave alone --------------------------
 
@@ -594,6 +705,20 @@ class DeepSeekFallbackTests(unittest.TestCase):
             self._run(output_type=RecursiveNodeModel)
 
         self.assertEqual(self.requests, [])
+
+    def test_deeply_nested_output_type_is_illustrated_and_validated(self):
+        """Finite nesting is not recursion: the request still goes out."""
+        self.reply = json.dumps(_deep_payload())
+
+        result = self._run(output_type=_deep_output_type())
+
+        body = self._one_request()
+        self.assertEqual(body["response_format"], {"type": "json_object"})
+        self.assertIn('"value": ""', body["messages"][0]["content"])
+        node = result.final_output
+        while hasattr(node, "child"):
+            node = node.child
+        self.assertEqual(node.value, "bottom")
 
     # --- the JSON example helper -------------------------------------------
 
@@ -674,6 +799,28 @@ class DeepSeekFallbackTests(unittest.TestCase):
             )
         )
 
+    def test_example_builds_a_deeply_nested_finite_schema(self):
+        """Deep is allowed: only a repeated reference is recursion."""
+        example = structured_output_fallback._json_schema_example(
+            _chain_schema(_DEEP_LEVELS)
+        )
+
+        depth = 0
+        node = example
+        while isinstance(node, dict) and "child" in node:
+            depth += 1
+            node = node["child"]
+        self.assertEqual(depth, _DEEP_LEVELS - 1)
+        self.assertEqual(node, {"value": ""})
+
+    def test_example_rejects_a_schema_too_large_to_illustrate(self):
+        """Acyclic but exploding: a size error, not a recursion error."""
+        with self.assertRaises(ValueError) as raised:
+            structured_output_fallback._json_schema_example(_doubling_schema(12))
+
+        self.assertIn("too deep or too wide", str(raised.exception))
+        self.assertNotIn("recursive", str(raised.exception))
+
     def test_example_rejects_recursive_schemas(self):
         schema = {
             "$defs": {
@@ -686,8 +833,11 @@ class DeepSeekFallbackTests(unittest.TestCase):
             "$ref": "#/$defs/Node",
         }
 
-        with self.assertRaisesRegex(ValueError, "recursive"):
+        with self.assertRaises(ValueError) as raised:
             structured_output_fallback._json_schema_example(schema)
+
+        self.assertIn("recursive", str(raised.exception))
+        self.assertNotIn("too deep or too wide", str(raised.exception))
 
     def test_example_rejects_unsupported_shapes(self):
         for schema in (
