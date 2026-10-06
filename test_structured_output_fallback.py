@@ -1586,15 +1586,22 @@ class TwoPhaseFallbackTests(unittest.TestCase):
         self.assertEqual(formatter["response_format"], {"type": "json_object"})
         self.assertNotIn("tools", formatter)
 
-        # The formatter sees the turn that produced the answer, not only the
-        # answer: history, the work result, then one formatting instruction.
+        # The formatter sees the question and the answer it has to convert,
+        # and nothing else: one user turn of history, then the work answer and
+        # the formatting instruction together in one final user turn. No
+        # assistant turn of our own, because a forced function call is ignored
+        # after a replayed assistant turn on the real MiniMax endpoint.
         self.assertEqual(
             [message["role"] for message in formatter["messages"]],
-            ["system", "user", "assistant", "user"],
+            ["system", "user", "user"],
+        )
+        self.assertEqual(
+            formatter["messages"][1]["content"], "Plan some research."
         )
         self.assertEqual(
             formatter["messages"][2]["content"],
-            "Found httpx2 in the catalogue.",
+            "Found httpx2 in the catalogue.\n\n"
+            + structured_output_fallback._FORMAT_REQUEST_TEXT,
         )
 
         self.assertEqual(len(response.output), 1)
@@ -1627,10 +1634,86 @@ class TwoPhaseFallbackTests(unittest.TestCase):
             },
         )
         self.assertEqual(self._tool_names(formatter), ["emit_typed_output"])
+        # The role shape the live endpoint needs: no assistant turn of our own
+        # before the forced call, and the instruction still last.
+        self.assertEqual(
+            [message["role"] for message in formatter["messages"]],
+            ["system", "user", "user"],
+        )
+        self.assertIn(
+            "Found httpx2 in the catalogue.", formatter["messages"][2]["content"]
+        )
+        self.assertTrue(
+            formatter["messages"][2]["content"].endswith(
+                structured_output_fallback._FORMAT_REQUEST_TEXT
+            )
+        )
         self.assertEqual(
             json.loads(response.output[0].content[0].text),
             json.loads(self.arguments),
         )
+
+    def test_formatter_wire_roles_are_system_then_user_turns(self):
+        """The role shape the live MiniMax endpoint needs, per mode.
+
+        MiniMax-M3 ignores a forced ``emit_typed_output`` call after replayed
+        assistant turns, so a formatter request is system instructions, the
+        original user turns, and one final user turn carrying the work answer
+        and the output instruction. No assistant turn and no tool record.
+        """
+        for mode in ("deepseek_json", "minimax_function"):
+            with self.subTest(mode=mode):
+                self.requests = []
+                self.script = [
+                    self._text("Found httpx2."),
+                    self._text(self.arguments)
+                    if mode == "deepseek_json"
+                    else {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            self._call("emit_typed_output", self.arguments)
+                        ],
+                    },
+                ]
+
+                self._get(mode=mode, tools=[self._tool()], input=self._mixed_history())
+
+                work, formatter = self.requests
+                self.assertEqual(self._tool_names(work), ["lookup_library"])
+                self.assertEqual(
+                    [message["role"] for message in formatter["messages"]],
+                    ["system", "user", "user", "user"],
+                )
+                # The original user content and the terminal work answer are
+                # both there, in order, and the instruction closes the request.
+                self.assertEqual(
+                    formatter["messages"][1]["content"], "Plan some research."
+                )
+                self.assertEqual(
+                    formatter["messages"][2]["content"],
+                    "Structured output, please.",
+                )
+                self.assertEqual(
+                    formatter["messages"][3]["content"],
+                    "Found httpx2.\n\n"
+                    + structured_output_fallback._FORMAT_REQUEST_TEXT,
+                )
+                self.assertNotIn(
+                    "tool", [message["role"] for message in formatter["messages"]]
+                )
+                self.assertNotIn(
+                    "assistant",
+                    [message["role"] for message in formatter["messages"]],
+                )
+                self.assertNotIn("call_missing", json.dumps(formatter))
+                if mode == "deepseek_json":
+                    self.assertNotIn("tools", formatter)
+                else:
+                    # The only tool a MiniMax formatter declares is its own.
+                    self.assertEqual(
+                        self._tool_names(formatter), ["emit_typed_output"]
+                    )
 
     def test_handoffs_are_never_sent_to_the_formatter(self):
         self.script = [
@@ -1658,10 +1741,58 @@ class TwoPhaseFallbackTests(unittest.TestCase):
 
     def test_formatter_history_drops_replayed_tool_records(self):
         """The formatter declares no tools, so no tool record may travel."""
-        history = [
+        history = self._mixed_history()
+        self.script = [self._text("Found httpx2."), self._text(self.arguments)]
+
+        self._get(tools=[self._tool()], input=history)
+
+        formatter = self.requests[1]
+        # Only the original user turns survive, and the work answer is merged
+        # into the final user turn instead of standing as an assistant turn.
+        self.assertEqual(
+            [message["role"] for message in formatter["messages"]],
+            ["system", "user", "user", "user"],
+        )
+        self.assertEqual(
+            [message["content"] for message in formatter["messages"][1:3]],
+            ["Plan some research.", "Structured output, please."],
+        )
+        self.assertEqual(
+            formatter["messages"][3]["content"],
+            "Found httpx2.\n\n" + structured_output_fallback._FORMAT_REQUEST_TEXT,
+        )
+
+        rendered = json.dumps(formatter)
+        self.assertNotIn("tool", [message["role"] for message in formatter["messages"]])
+        self.assertNotIn(
+            "assistant", [message["role"] for message in formatter["messages"]]
+        )
+        # Every replay-only record is gone, including the answer to a call the
+        # history never opened: a dangling id is exactly what a tool-free
+        # formatter request cannot carry.
+        for replayed in (
+            "lookup_library",
+            "CATALOGUE_RESULT_42",
+            "ORPHANED_RESULT_7",
+            "call_1",
+            "call_missing",
+            "Let me check the catalogue.",
+            "Found it, now planning.",
+        ):
+            with self.subTest(replayed=replayed):
+                self.assertNotIn(replayed, rendered)
+
+    def _mixed_history(self) -> list[dict[str, object]]:
+        """A work history with assistant turns and tool records to replay.
+
+        ``call_missing`` is deliberately dangling: it names a call this
+        request does not declare and the history never opened, which is the
+        shape the real MiniMax endpoint rejected.
+        """
+        return [
             {"role": "user", "content": "Plan some research."},
             {"role": "assistant", "content": "Let me check the catalogue."},
-            # What a executed turn leaves in the runner's input: the
+            # What an executed turn leaves in the runner's input: the
             # invocation, then its result.
             {
                 "type": "function_call",
@@ -1674,29 +1805,14 @@ class TwoPhaseFallbackTests(unittest.TestCase):
                 "call_id": "call_1",
                 "output": "CATALOGUE_RESULT_42",
             },
+            {
+                "type": "function_call_output",
+                "call_id": "call_missing",
+                "output": "ORPHANED_RESULT_7",
+            },
+            {"role": "assistant", "content": "Found it, now planning."},
+            {"role": "user", "content": "Structured output, please."},
         ]
-        self.script = [self._text("Found httpx2."), self._text(self.arguments)]
-
-        self._get(tools=[self._tool()], input=history)
-
-        formatter = self.requests[1]
-        self.assertEqual(
-            [message["role"] for message in formatter["messages"]],
-            ["system", "user", "assistant", "assistant", "user"],
-        )
-        self.assertEqual(
-            formatter["messages"][1]["content"], "Plan some research."
-        )
-        self.assertEqual(
-            formatter["messages"][2]["content"], "Let me check the catalogue."
-        )
-        self.assertEqual(formatter["messages"][3]["content"], "Found httpx2.")
-
-        rendered = json.dumps(formatter)
-        self.assertNotIn("tool", [message["role"] for message in formatter["messages"]])
-        for replayed in ("lookup_library", "CATALOGUE_RESULT_42", "call_1"):
-            with self.subTest(replayed=replayed):
-                self.assertNotIn(replayed, rendered)
 
     def test_format_request_filters_records_the_transport_cannot_carry(self):
         """A direct check of the filter, for shapes the wire cannot show.
@@ -1706,23 +1822,10 @@ class TwoPhaseFallbackTests(unittest.TestCase):
         observed in a request body. They are still history an input list may
         carry, so the filter is asserted on directly.
         """
-        history = [
-            {"role": "user", "content": "Plan some research."},
-            {"role": "assistant", "content": "Let me check the catalogue."},
-            {
-                "type": "function_call",
-                "call_id": "call_1",
-                "name": "lookup_library",
-                "arguments": '{"name": "httpx2"}',
-            },
-            {
-                "type": "function_call_output",
-                "call_id": "call_1",
-                "output": "CATALOGUE_RESULT_42",
-            },
+        history = self._mixed_history() + [
             {
                 "role": "tool",
-                "tool_call_id": "call_1",
+                "tool_call_id": "call_missing",
                 "content": "CATALOGUE_RESULT_42",
             },
             {
@@ -1747,15 +1850,32 @@ class TwoPhaseFallbackTests(unittest.TestCase):
             )
         )
 
+        # Only the user turns stay; every assistant turn, function-call record
+        # and tool-role or MCP record is dropped, and the work answer travels
+        # inside the final user turn rather than as an assistant turn.
         self.assertEqual(
             [(message["role"], message["content"]) for message in messages],
             [
                 ("user", "Plan some research."),
-                ("assistant", "Let me check the catalogue."),
-                ("assistant", "Found httpx2."),
-                ("user", structured_output_fallback._FORMAT_REQUEST_TEXT),
+                ("user", "Structured output, please."),
+                (
+                    "user",
+                    "Found httpx2.\n\n"
+                    + structured_output_fallback._FORMAT_REQUEST_TEXT,
+                ),
             ],
         )
+
+    def test_format_request_does_not_mutate_the_caller_history(self):
+        """The input list is the runner's; the formatter may not rewrite it."""
+        history = self._mixed_history()
+        before = [dict(item) for item in history]
+
+        structured_output_fallback.append_assistant_text_and_format_request(
+            history, "Found httpx2.", self._schema()
+        )
+
+        self.assertEqual(history, before)
 
     def test_list_input_history_is_preserved(self):
         history = [
@@ -1768,10 +1888,18 @@ class TwoPhaseFallbackTests(unittest.TestCase):
         self._get(tools=[self._tool()], input=history)
 
         formatter = self.requests[1]
+        # The original user turns survive in order; the assistant turn between
+        # them does not, because two of our own turns in a row is the shape the
+        # live endpoint refused to answer with a forced call.
         self.assertEqual(
-            [message["content"] for message in formatter["messages"][1:4]],
-            ["Plan some research.", "Which area?", "Structured output."],
+            [message["content"] for message in formatter["messages"][1:3]],
+            ["Plan some research.", "Structured output."],
         )
+        self.assertEqual(
+            [message["role"] for message in formatter["messages"]],
+            ["system", "user", "user", "user"],
+        )
+        self.assertEqual(history[1]["content"], "Which area?", "input untouched")
 
     def test_formatter_output_that_is_not_the_schema_fails_visibly(self):
         self.script = [
@@ -1912,11 +2040,21 @@ class TwoPhaseFallbackTests(unittest.TestCase):
 
         # The formatter carries the question and the answer it has to format,
         # and none of the tool records behind them: it declares no tools, so a
-        # tool call id it cannot resolve would be rejected upstream.
+        # tool call id it cannot resolve would be rejected upstream. The answer
+        # and the instruction share one final user turn, so the request has no
+        # assistant turn of its own - the shape the live MiniMax endpoint needs
+        # before it honours the forced call.
         formatter = self.requests[2]
-        contents = [message["content"] for message in formatter["messages"]]
-        self.assertIn("Plan some research.", contents)
-        self.assertIn("Found httpx2 in the catalogue.", contents)
+        self.assertEqual(
+            [message["role"] for message in formatter["messages"]],
+            ["system", "user", "user"],
+        )
+        self.assertEqual(formatter["messages"][1]["content"], "Plan some research.")
+        self.assertEqual(
+            formatter["messages"][2]["content"],
+            "Found httpx2 in the catalogue.\n\n"
+            + structured_output_fallback._FORMAT_REQUEST_TEXT,
+        )
         self.assertNotIn(
             "tool", [message["role"] for message in formatter["messages"]]
         )

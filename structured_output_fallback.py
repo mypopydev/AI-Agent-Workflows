@@ -547,16 +547,24 @@ def append_assistant_text_and_format_request(
 ) -> list[TResponseInputItem]:
     """Build the formatting-phase input from the original one.
 
-    A string input becomes a one-message list, because the work answer has to
-    be appended as the assistant turn that follows it. A list input is copied
-    rather than extended: the caller's history is the runner's, and the
-    formatting request is a different turn on top of it.
+    A string input becomes a one-message list. A list input is copied rather
+    than extended: the caller's history is the runner's, and the formatting
+    request is a different turn on top of it.
 
-    Replayed tool invocations and their results are dropped. They are how the
-    runner recorded work that has already happened, and the formatter declares
-    no tools, so a call id it was never offered would make the request
-    malformed. The ordinary user and assistant text around them is the context
-    the formatter actually needs, and that is kept.
+    Everything but the caller's own user turns is dropped. The assistant turns,
+    tool invocations, tool results, MCP records and handoff calls in that
+    history describe work that has already happened, and a formatter that
+    declares no tools cannot name any of it: a call id it was never offered
+    makes the request malformed, and replaying assistant turns puts two
+    assistant turns in a row. The live MiniMax M3 endpoint was observed to
+    ignore a forced ``emit_typed_output`` call after replayed assistant turns
+    while honouring it for a user-only history, so this is the shape a
+    formatting request has to have.
+
+    The work answer therefore travels in the final user message, together with
+    the formatting instruction, instead of as an assistant turn of its own:
+    the formatter is told the answer rather than shown a conversation it did
+    not take part in, and the instruction stays the last thing in the request.
 
     ``output_schema`` is part of the interface the two phases are specified
     with, and no phase-A tool call travels as a callable tool; the schema
@@ -566,11 +574,23 @@ def append_assistant_text_and_format_request(
     messages: list[TResponseInputItem] = (
         [{"role": "user", "content": input}]
         if isinstance(input, str)
-        else [item for item in input if not _is_replay_only_input(item)]
+        else [item for item in input if _is_original_user_message(item)]
     )
-    messages.append({"role": "assistant", "content": text})
-    messages.append({"role": "user", "content": _FORMAT_REQUEST_TEXT})
+    messages.append(
+        {"role": "user", "content": f"{text}\n\n{_FORMAT_REQUEST_TEXT}"}
+    )
     return messages
+
+
+def _is_original_user_message(item: TResponseInputItem) -> bool:
+    """Whether an input item is a user turn the formatter can carry.
+
+    Only the caller's own user turns survive into a formatting request. The
+    system instructions travel separately, as they do in every other request,
+    and every other role - assistant, tool, or a record that only replays a
+    call - is work this request cannot represent.
+    """
+    return _item_field(item, "role") == "user" and not _is_replay_only_input(item)
 
 
 def _is_replay_only_input(item: TResponseInputItem) -> bool:
