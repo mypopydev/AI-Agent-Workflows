@@ -1368,7 +1368,9 @@ class TwoPhaseFallbackTests(unittest.TestCase):
             },
         )
 
-    def _model(self, mode: str = "deepseek_json", max_tokens: int | None = 2048):
+    def _model(
+        self, mode: str = "deepseek_json", max_tokens: int | None = 2048
+    ):
         client = AsyncOpenAI(
             api_key="test-key",
             base_url=_BASE_URL,
@@ -1431,9 +1433,10 @@ class TwoPhaseFallbackTests(unittest.TestCase):
         handoffs: tuple = (),
         input: str | list = "Plan some research.",
         model_settings: ModelSettings | None = None,
+        max_tokens: int | None = 2048,
     ):
         return asyncio.run(
-            self._model(mode).get_response(
+            self._model(mode, max_tokens=max_tokens).get_response(
                 "Plan the research.",
                 input,
                 ModelSettings() if model_settings is None else model_settings,
@@ -1651,6 +1654,107 @@ class TwoPhaseFallbackTests(unittest.TestCase):
             formatter["messages"][1]["content"], "Plan some research."
         )
 
+    def test_formatter_history_drops_replayed_tool_records(self):
+        """The formatter declares no tools, so no tool record may travel."""
+        history = [
+            {"role": "user", "content": "Plan some research."},
+            {"role": "assistant", "content": "Let me check the catalogue."},
+            # What a executed turn leaves in the runner's input: the
+            # invocation, then its result.
+            {
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "lookup_library",
+                "arguments": '{"name": "httpx2"}',
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": "CATALOGUE_RESULT_42",
+            },
+        ]
+        self.script = [self._text("Found httpx2."), self._text(self.arguments)]
+
+        self._get(tools=[self._tool()], input=history)
+
+        formatter = self.requests[1]
+        self.assertEqual(
+            [message["role"] for message in formatter["messages"]],
+            ["system", "user", "assistant", "assistant", "user"],
+        )
+        self.assertEqual(
+            formatter["messages"][1]["content"], "Plan some research."
+        )
+        self.assertEqual(
+            formatter["messages"][2]["content"], "Let me check the catalogue."
+        )
+        self.assertEqual(formatter["messages"][3]["content"], "Found httpx2.")
+
+        rendered = json.dumps(formatter)
+        self.assertNotIn("tool", [message["role"] for message in formatter["messages"]])
+        for replayed in ("lookup_library", "CATALOGUE_RESULT_42", "call_1"):
+            with self.subTest(replayed=replayed):
+                self.assertNotIn(replayed, rendered)
+
+    def test_format_request_filters_records_the_transport_cannot_carry(self):
+        """A direct check of the filter, for shapes the wire cannot show.
+
+        A raw ``role="tool"`` message and an ``mcp_call`` are both rejected by
+        the SDK's converter, so they can never survive a work phase to be
+        observed in a request body. They are still history an input list may
+        carry, so the filter is asserted on directly.
+        """
+        history = [
+            {"role": "user", "content": "Plan some research."},
+            {"role": "assistant", "content": "Let me check the catalogue."},
+            {
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "lookup_library",
+                "arguments": '{"name": "httpx2"}',
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": "CATALOGUE_RESULT_42",
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": "CATALOGUE_RESULT_42",
+            },
+            {
+                "type": "mcp_call",
+                "id": "mcp_1",
+                "name": "search_docs",
+                "arguments": '{"query": "structured output"}',
+                "server_label": "docs",
+            },
+            {
+                "type": "mcp_approval_request",
+                "id": "mcp_2",
+                "name": "search_docs",
+                "arguments": "{}",
+                "server_label": "docs",
+            },
+        ]
+
+        messages = (
+            structured_output_fallback.append_assistant_text_and_format_request(
+                history, "Found httpx2.", self._schema()
+            )
+        )
+
+        self.assertEqual(
+            [(message["role"], message["content"]) for message in messages],
+            [
+                ("user", "Plan some research."),
+                ("assistant", "Let me check the catalogue."),
+                ("assistant", "Found httpx2."),
+                ("user", structured_output_fallback._FORMAT_REQUEST_TEXT),
+            ],
+        )
+
     def test_list_input_history_is_preserved(self):
         history = [
             {"role": "user", "content": "Plan some research."},
@@ -1677,6 +1781,46 @@ class TwoPhaseFallbackTests(unittest.TestCase):
             self._get(tools=[self._tool()])
 
         self.assertEqual(len(self.requests), 2, "both phases were attempted")
+
+    # --- configuration -----------------------------------------------------
+
+    def test_missing_deepseek_budget_fails_before_the_work_request(self):
+        """The budget is a configuration error, so nothing may be paid for.
+
+        Phase two cannot run without it, and discovering that after phase one
+        would charge for a work request whose answer can never be formatted.
+        """
+        self.script = [self._text("Found httpx2."), self._text(self.arguments)]
+
+        with self.assertRaisesRegex(ValueError, "token budget"):
+            self._get(
+                mode="deepseek_json",
+                tools=[self._tool()],
+                max_tokens=None,
+            )
+
+        self.assertEqual(self.requests, [], "no request may be paid for")
+
+    def test_minimax_two_phase_needs_no_token_budget(self):
+        """Only DeepSeek JSON mode needs a budget: MiniMax formats anyway."""
+        self.script = [
+            self._text("Found httpx2."),
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [self._call("emit_typed_output", self.arguments)],
+            },
+        ]
+
+        response = self._get(
+            mode="minimax_function", tools=[self._tool()], max_tokens=None
+        )
+
+        self.assertEqual(len(self.requests), 2)
+        self.assertEqual(
+            json.loads(response.output[0].content[0].text),
+            json.loads(self.arguments),
+        )
 
     # --- accounting --------------------------------------------------------
 
@@ -1763,6 +1907,21 @@ class TwoPhaseFallbackTests(unittest.TestCase):
         self.assertEqual(len(self.requests), 3)
         self.assertEqual(len(self.requests[0]["tools"]), 1)
         self.assertNotIn("tools", self.requests[2])
+
+        # The formatter carries the question and the answer it has to format,
+        # and none of the tool records behind them: it declares no tools, so a
+        # tool call id it cannot resolve would be rejected upstream.
+        formatter = self.requests[2]
+        contents = [message["content"] for message in formatter["messages"]]
+        self.assertIn("Plan some research.", contents)
+        self.assertIn("Found httpx2 in the catalogue.", contents)
+        self.assertNotIn(
+            "tool", [message["role"] for message in formatter["messages"]]
+        )
+        rendered = json.dumps(formatter)
+        for replayed in ("lookup_library", "call_1", "tool_call_id"):
+            with self.subTest(replayed=replayed):
+                self.assertNotIn(replayed, rendered)
 
 
 class StreamingFallbackTests(unittest.TestCase):

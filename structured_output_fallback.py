@@ -80,6 +80,20 @@ _FORMAT_REQUEST_TEXT = (
     "schema. Return JSON only: no prose, no Markdown fences, no extra keys."
 )
 
+# Input items that only replay a tool invocation or its result. The formatting
+# phase declares no tools, so carrying one of these would hand the provider a
+# tool name or call id it was never offered: the answer it has to format is the
+# assistant text, and the history that matters is the conversation around it.
+_REPLAY_ONLY_INPUT_TYPES = frozenset(
+    {
+        "function_call",
+        "function_call_output",
+        "mcp_call",
+        "mcp_approval_request",
+        "mcp_approval_response",
+    }
+)
+
 _mode: str | None = None
 _fallback_max_tokens: int | None = None
 _installed = False
@@ -307,6 +321,13 @@ class FallbackChatCompletionsModel(OpenAIChatCompletionsModel):
         all, and anything the runner still has to execute is handed back
         untouched for its own loop to run.
         """
+        # A missing budget is a configuration problem that will stop the
+        # formatting phase, so it is checked before the work request is paid
+        # for rather than after: discovering it then would mean charging for a
+        # turn whose answer could never be formatted.
+        if self._fallback_mode == _DEEPSEEK_JSON_MODE:
+            self._require_json_mode_budget(model_settings)
+
         work = await self._sdk_get_response(
             system_instructions,
             input,
@@ -439,14 +460,13 @@ class FallbackChatCompletionsModel(OpenAIChatCompletionsModel):
             and bool(tools or handoffs)
         )
 
-    def _json_mode_settings(self, model_settings: ModelSettings) -> ModelSettings:
-        """Add JSON mode to the settings, keeping every other caller value.
+    def _require_json_mode_budget(self, model_settings: ModelSettings) -> int:
+        """The token budget JSON mode needs, or a configuration error.
 
-        ``response_format`` has to travel in ``extra_body``: the SDK passes its
-        own ``response_format`` from the output schema, and ``extra_body`` is
-        merged over it by the OpenAI client. ``extra_args`` is not an
-        alternative here - it collides with that keyword and raises instead of
-        overriding it.
+        DeepSeek truncates JSON output without a budget, so the budget is part
+        of what this protocol can serve. It is resolved separately from the
+        settings so a caller that will need it can check it before sending any
+        request at all.
         """
         max_tokens = (
             model_settings.max_tokens
@@ -459,13 +479,24 @@ class FallbackChatCompletionsModel(OpenAIChatCompletionsModel):
                 "agent, or AGENT_STRUCTURED_OUTPUT_MAX_TOKENS for the examples "
                 "that set none. DeepSeek truncates JSON output without one."
             )
+        return max_tokens
+
+    def _json_mode_settings(self, model_settings: ModelSettings) -> ModelSettings:
+        """Add JSON mode to the settings, keeping every other caller value.
+
+        ``response_format`` has to travel in ``extra_body``: the SDK passes its
+        own ``response_format`` from the output schema, and ``extra_body`` is
+        merged over it by the OpenAI client. ``extra_args`` is not an
+        alternative here - it collides with that keyword and raises instead of
+        overriding it.
+        """
         return dataclasses.replace(
             model_settings,
             extra_body={
                 **(model_settings.extra_body or {}),
                 "response_format": {"type": "json_object"},
             },
-            max_tokens=max_tokens,
+            max_tokens=self._require_json_mode_budget(model_settings),
         )
 
     def _function_call_settings(
@@ -521,17 +552,47 @@ def append_assistant_text_and_format_request(
     rather than extended: the caller's history is the runner's, and the
     formatting request is a different turn on top of it.
 
+    Replayed tool invocations and their results are dropped. They are how the
+    runner recorded work that has already happened, and the formatter declares
+    no tools, so a call id it was never offered would make the request
+    malformed. The ordinary user and assistant text around them is the context
+    the formatter actually needs, and that is kept.
+
     ``output_schema`` is part of the interface the two phases are specified
     with, and no phase-A tool call travels as a callable tool; the schema
     itself is described by the selected protocol, not by this instruction, so
     it is not repeated here.
     """
     messages: list[TResponseInputItem] = (
-        [{"role": "user", "content": input}] if isinstance(input, str) else list(input)
+        [{"role": "user", "content": input}]
+        if isinstance(input, str)
+        else [item for item in input if not _is_replay_only_input(item)]
     )
     messages.append({"role": "assistant", "content": text})
     messages.append({"role": "user", "content": _FORMAT_REQUEST_TEXT})
     return messages
+
+
+def _is_replay_only_input(item: TResponseInputItem) -> bool:
+    """Whether an input item only replays a tool the formatter cannot name.
+
+    The Chat Completions spelling of a replayed result is a ``tool``-role
+    message or an assistant turn carrying ``tool_calls``, so those are dropped
+    alongside the Responses-spelling items: both name a call this request does
+    not declare.
+    """
+    if _item_field(item, "type") in _REPLAY_ONLY_INPUT_TYPES:
+        return True
+    if _item_field(item, "role") == "tool":
+        return True
+    return bool(_item_field(item, "tool_calls") or _item_field(item, "function_call"))
+
+
+def _item_field(item: TResponseInputItem, name: str) -> object:
+    """Read one field from an input item, dict or model."""
+    if isinstance(item, dict):
+        return item.get(name)
+    return getattr(item, name, None)
 
 
 def _aggregate_two_responses(
