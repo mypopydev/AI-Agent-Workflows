@@ -20,8 +20,14 @@ import json
 import weakref
 
 from agents.agent_output import AgentOutputSchemaBase
+from agents.exceptions import ModelBehaviorError
 from agents.handoffs import Handoff
-from agents.items import TResponseInputItem
+from agents.items import (
+    ResponseOutputMessage,
+    ResponseOutputRefusal,
+    ResponseOutputText,
+    TResponseInputItem,
+)
 from agents.model_settings import ModelSettings
 from agents.models.interface import ModelResponse, ModelTracing
 from agents.models.openai_chatcompletions import OpenAIChatCompletionsModel
@@ -123,7 +129,7 @@ class FallbackChatCompletionsModel(OpenAIChatCompletionsModel):
         instructions = _json_instructions(output_schema) + (
             system_instructions or ""
         )
-        return await self._sdk_get_response(
+        response = await self._sdk_get_response(
             instructions,
             input,
             settings,
@@ -135,6 +141,8 @@ class FallbackChatCompletionsModel(OpenAIChatCompletionsModel):
             conversation_id,
             prompt,
         )
+        _reject_silent_empty_output(response)
+        return response
 
     async def _sdk_get_response(
         self,
@@ -199,6 +207,37 @@ class FallbackChatCompletionsModel(OpenAIChatCompletionsModel):
             },
             max_tokens=max_tokens,
         )
+
+
+def _reject_silent_empty_output(response: ModelResponse) -> None:
+    """Fail a JSON-mode response that carries no assistant text or refusal.
+
+    Passing such a response through is not the visible failure the design
+    asks for: the runner only validates output text it found, so an empty
+    completion is retried until the turn limit and surfaces as ten requests
+    and a ``MaxTurnsExceeded``, with nothing pointing at the provider. DeepSeek
+    documents JSON mode returning empty content, so the adapter reports it as
+    the typed-output failure it is, after the request and its usage have been
+    recorded. A refusal is a terminal answer too, so it is left to the SDK's
+    own refusal handling.
+    """
+    # ModelResponse.output holds raw Responses items, not the run-item
+    # wrappers the runner builds from them later.
+    for item in response.output:
+        if not isinstance(item, ResponseOutputMessage):
+            continue
+        for part in item.content:
+            if isinstance(part, ResponseOutputRefusal):
+                return
+            if isinstance(part, ResponseOutputText) and part.text:
+                return
+
+    raise ModelBehaviorError(
+        "DeepSeek JSON mode returned a completed response with no assistant "
+        "text or refusal, so there is no JSON output to validate. This is the "
+        "documented DeepSeek empty-content failure: raise max_tokens, or check "
+        "that the endpoint really supports JSON mode."
+    )
 
 
 def _json_instructions(output_schema: AgentOutputSchemaBase) -> str:

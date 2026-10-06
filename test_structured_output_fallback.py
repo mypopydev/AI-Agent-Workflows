@@ -32,7 +32,7 @@ import httpx2
 from agents import Agent, Runner, function_tool, set_tracing_disabled
 from agents.agent_output import AgentOutputSchema
 from agents.exceptions import ModelBehaviorError
-from agents.items import ItemHelpers, MessageOutputItem
+from agents.items import ResponseOutputMessage, ResponseOutputRefusal
 from agents.model_settings import ModelSettings
 from agents.models.interface import ModelTracing
 from agents.tracing import setup as tracing_setup
@@ -435,6 +435,7 @@ class DeepSeekFallbackTests(unittest.TestCase):
             }
         )
         self.finish_reason = "stop"
+        self.refusal: str | None = None
         self._clients: list[AsyncOpenAI] = []
 
         # Tracing defaults to a processor that exports to api.openai.com, so it
@@ -453,6 +454,9 @@ class DeepSeekFallbackTests(unittest.TestCase):
 
     def _handle_request(self, request: httpx2.Request) -> httpx2.Response:
         self.requests.append(json.loads(request.content))
+        message: dict[str, object] = {"role": "assistant", "content": self.reply}
+        if self.refusal is not None:
+            message["refusal"] = self.refusal
         return httpx2.Response(
             200,
             json={
@@ -463,10 +467,7 @@ class DeepSeekFallbackTests(unittest.TestCase):
                 "choices": [
                     {
                         "index": 0,
-                        "message": {
-                            "role": "assistant",
-                            "content": self.reply,
-                        },
+                        "message": message,
                         "finish_reason": self.finish_reason,
                     }
                 ],
@@ -625,16 +626,26 @@ class DeepSeekFallbackTests(unittest.TestCase):
         with self.assertRaises(ModelBehaviorError):
             self._run()
 
-    def test_empty_json_content_is_not_fabricated_and_fails_validation(self):
+    def test_empty_json_content_fails_immediately(self):
         """The documented DeepSeek failure: HTTP 200, empty JSON content.
 
-        The runner only validates when it found text, so it would loop for ten
-        turns on this response. Validating the text the runner would have read
-        is what makes the failure visible instead, and it only stays visible
-        while the adapter passes the empty completion through unchanged.
+        The runner only validates output text it found, so an empty completion
+        would otherwise be retried until MaxTurnsExceeded. One request and a
+        ModelBehaviorError is the visible failure the design asks for.
         """
         self.reply = ""
         self.finish_reason = "stop"
+
+        with self.assertRaisesRegex(ModelBehaviorError, "DeepSeek JSON mode"):
+            self._run()
+
+        self.assertEqual(len(self.requests), 1, "the run must not retry")
+
+    def test_refusal_output_item_is_preserved(self):
+        """A refusal is terminal too: it is output, not missing output."""
+        self.reply = ""
+        self.finish_reason = "stop"
+        self.refusal = "I cannot help with that."
         schema = AgentOutputSchema(ResearchPlanModel, strict_json_schema=True)
 
         response = asyncio.run(
@@ -649,29 +660,16 @@ class DeepSeekFallbackTests(unittest.TestCase):
             )
         )
 
-        self.assertEqual(
-            self._one_request()["response_format"], {"type": "json_object"}
-        )
-        text = self._final_output_text(response)
-        self.assertFalse(text, "the adapter must not invent JSON content")
-        with self.assertRaisesRegex(ModelBehaviorError, "Invalid JSON"):
-            schema.validate_json(text or "")
-
-    @staticmethod
-    def _final_output_text(response) -> str | None:
-        """The text the runner would validate, or ``None`` if there is none.
-
-        Mirrors ``agents.run_internal.turn_resolution``: the text is read off
-        the last message item, so no message at all means no text.
-        """
-        messages = [
-            item
+        refusals = [
+            part
             for item in response.output
-            if isinstance(item, MessageOutputItem)
+            if isinstance(item, ResponseOutputMessage)
+            for part in item.content
+            if isinstance(part, ResponseOutputRefusal)
         ]
-        if not messages:
-            return None
-        return ItemHelpers.extract_text(messages[-1].raw_item)
+        self.assertEqual(
+            [part.refusal for part in refusals], ["I cannot help with that."]
+        )
 
     # --- requests the adaptation must leave alone --------------------------
 
