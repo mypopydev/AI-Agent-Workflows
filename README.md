@@ -114,6 +114,57 @@ provider directly rather than through an agent, so it follows `VISION_MODEL`,
 falling back to `AGENT_MODEL`. `chapter_02/02` sets `temperature=0.0`, which
 reasoning-style models reject — set `AGENT_TEMPERATURE=1` if yours is one.
 
+#### Structured output on providers that reject `json_schema`
+
+35 examples set `output_type`, which the Agents SDK sends as
+`response_format: json_schema`. Some providers reject that outright (seven
+tested DeepSeek IDs failed with `400`/`400006`) and others accept it but answer
+in prose, which the SDK reports as `ModelBehaviorError: Invalid JSON when
+parsing model output`. Two opt-in fallback protocols exist for those
+endpoints:
+
+```bash
+AGENT_STRUCTURED_OUTPUT_MODE=deepseek_json python chapter_02/03_output_types_basic.py
+AGENT_STRUCTURED_OUTPUT_MODE=minimax_function python chapter_02/03_output_types_basic.py
+```
+
+- `deepseek_json` sends Chat Completions `response_format:
+  {"type":"json_object"}` and adds a system instruction carrying the schema and
+  a JSON example. DeepSeek's JSON mode guarantees **syntactically valid JSON,
+  not schema compliance** — the reply can be valid JSON in the wrong shape, and
+  it can also come back empty or truncated, so give it a budget with
+  `AGENT_STRUCTURED_OUTPUT_MAX_TOKENS` (or `max_tokens` on the agent) when the
+  example sets none.
+- `minimax_function` adds one synthetic formatting function,
+  `emit_typed_output`, whose parameters are generated from the declared output
+  schema, and forces it with `tool_choice`. The arguments come back as a tool
+  call that the adapter turns into the assistant JSON text the SDK expects; the
+  synthetic call never reaches the runner as an application tool call.
+
+Set `AGENT_MODEL` to a model the endpoint serves alongside either mode. The
+mode is chosen explicitly for the whole endpoint behind `OPENAI_BASE_URL` and
+is never inferred from the model id, because aliases and relays are not
+reliable provider identifiers. Both modes need the Chat Completions route, so
+combining one with `OPENAI_AGENTS_CHAT_API=0` fails at startup. Leaving
+`AGENT_STRUCTURED_OUTPUT_MODE` unset keeps the SDK's native `json_schema`
+behaviour, which is what OpenAI and providers that implement it want.
+
+Three limits apply to both:
+
+- **Validation stays local.** The fallback changes how the model is asked, not
+  what the answer is checked against: the reply is still validated locally
+  against the original `output_type`, so a well-formed answer in the wrong
+  shape is still reported as a failure rather than passed through.
+- **Tool-bearing agents cost a second request.** A formatting function must
+  never compete with an agent's own tools, MCP tools or handoffs in the same
+  turn — providers have been observed to skip the tool entirely and answer
+  anyway. Those agents run in two phases instead: the real tools run first with
+  no output constraint, and only a terminal text answer triggers a second,
+  tool-free formatting request.
+- **Typed output cannot be streamed.** A typed agent run through
+  `Runner.run_streamed` is not supported in either mode, and fails before any
+  request is sent rather than emitting an unvalidated stream.
+
 #### Choosing `AGENT_MODEL`
 
 Providers usually serve many models, but only some can run every example. Two

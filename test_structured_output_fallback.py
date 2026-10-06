@@ -23,6 +23,8 @@ import asyncio
 import importlib
 import json
 import os
+import pathlib
+import re
 import sys
 import unittest
 from typing import Any, Literal
@@ -2033,6 +2035,144 @@ class StreamingFallbackTests(unittest.TestCase):
 
     async def _consume(self, stream) -> list[object]:
         return [event async for event in stream]
+
+
+_ENV_EXAMPLE = pathlib.Path(__file__).resolve().parent / ".env.example"
+_README = pathlib.Path(__file__).resolve().parent / "README.md"
+
+# The exact wording the documentation is required to carry, kept here rather
+# than inline in each test so a reworded sentence fails in one place.
+_DOC_PHRASES = {
+    "endpoint_wide": "endpoint-wide",
+    "not_inferred": "never inferred from the model id",
+    "local_validation": "validated locally",
+    "two_phase_cost": r"[Tt]wo phases.{0,120}extra request",
+    "no_streaming": "[Ss]treaming typed output is not supported",
+    "syntax_only": "syntactically valid JSON",
+    "not_schema_enforcement": "not schema compliance",
+}
+
+
+def _documented_modes(text: str) -> set[str]:
+    """Every mode value ``text`` offers for AGENT_STRUCTURED_OUTPUT_MODE."""
+    return set(re.findall(r"AGENT_STRUCTURED_OUTPUT_MODE=(\w+)", text))
+
+
+class DocumentationTests(unittest.TestCase):
+    """The fallback is opt-in, so the two docs are the only way to find it.
+
+    These read the real files instead of restating them: a mode the adapter
+    supports but nobody documented is a mode nobody will turn on, and a mode
+    the docs promise but the adapter rejects is worse than either.
+    """
+
+    def setUp(self) -> None:
+        self.env_example = _ENV_EXAMPLE.read_text(encoding="utf-8")
+        self.readme = _README.read_text(encoding="utf-8")
+
+    def _assert_documents(self, text: str, pattern: str, what: str) -> None:
+        """Assert ``pattern`` matches, without dumping the whole file.
+
+        assertRegex prints the subject on failure, which for README.md is a
+        few kilobytes of Markdown between the reader and the one line that
+        matters.
+        """
+        self.assertTrue(
+            re.search(pattern, text, re.DOTALL) is not None,
+            f"not documented: {what}",
+        )
+
+    # --- .env.example ---------------------------------------------------
+
+    def test_env_example_offers_every_supported_mode(self):
+        self.assertEqual(
+            _documented_modes(self.env_example),
+            set(structured_output_fallback._FALLBACK_MODES),
+        )
+
+    def test_env_example_leaves_every_mode_commented_out(self):
+        # Opt-in: a template that enabled a mode by default would silently
+        # switch every typed example onto a non-native protocol.
+        for mode in structured_output_fallback._FALLBACK_MODES:
+            with self.subTest(mode=mode):
+                self.assertRegex(
+                    self.env_example,
+                    rf"(?m)^#AGENT_STRUCTURED_OUTPUT_MODE={mode}$",
+                )
+
+    def test_env_example_says_the_mode_is_endpoint_wide(self):
+        self.assertIn(_DOC_PHRASES["endpoint_wide"], self.env_example)
+        self.assertIn(_DOC_PHRASES["not_inferred"], self.env_example)
+
+    def test_env_example_documents_the_token_budget(self):
+        self.assertIn("AGENT_STRUCTURED_OUTPUT_MAX_TOKENS", self.env_example)
+
+    def test_env_example_documents_the_two_phase_cost(self):
+        self._assert_documents(
+            self.env_example,
+            _DOC_PHRASES["two_phase_cost"],
+            "the extra request tool-bearing agents cost",
+        )
+
+    def test_env_example_documents_that_validation_stays_local(self):
+        self.assertIn(_DOC_PHRASES["local_validation"], self.env_example)
+
+    def test_env_example_documents_the_stream_limitation(self):
+        self._assert_documents(
+            self.env_example,
+            _DOC_PHRASES["no_streaming"],
+            "the streamed typed-output limitation",
+        )
+
+    # --- README ---------------------------------------------------------
+
+    def test_readme_offers_every_supported_mode(self):
+        self.assertEqual(
+            _documented_modes(self.readme),
+            set(structured_output_fallback._FALLBACK_MODES),
+        )
+
+    def test_readme_shows_how_to_select_each_mode(self):
+        for mode in structured_output_fallback._FALLBACK_MODES:
+            with self.subTest(mode=mode):
+                self._assert_documents(
+                    self.readme,
+                    rf"AGENT_STRUCTURED_OUTPUT_MODE={mode}\s+python",
+                    f"a command that selects {mode}",
+                )
+
+    def test_readme_explains_deepseek_json_is_syntax_only(self):
+        self.assertIn(_DOC_PHRASES["syntax_only"], self.readme)
+        self.assertIn(_DOC_PHRASES["not_schema_enforcement"], self.readme)
+
+    def test_readme_explains_minimax_uses_a_forced_synthetic_function(self):
+        format_tool = structured_output_fallback._FORMAT_TOOL_NAME
+        self.assertIn(format_tool, self.readme)
+        self._assert_documents(
+            self.readme,
+            r"[Ff]orces?.{0,80}tool_choice",
+            "that the synthetic function is forced with tool_choice",
+        )
+
+    def test_readme_documents_that_validation_stays_local(self):
+        self.assertIn(_DOC_PHRASES["local_validation"], self.readme)
+
+    def test_readme_documents_the_second_request_for_tool_bearing_agents(self):
+        self.assertIn("second request", self.readme)
+
+    def test_readme_documents_the_stream_limitation(self):
+        self._assert_documents(
+            self.readme,
+            r"Runner\.run_streamed.{0,120}not supported",
+            "that streamed typed output is unsupported",
+        )
+
+    def test_readme_documents_that_unset_keeps_the_native_json_schema(self):
+        self._assert_documents(
+            self.readme,
+            r"[Uu]nset.{0,200}json_schema",
+            "that leaving the mode unset keeps the native json_schema request",
+        )
 
 
 if __name__ == "__main__":
