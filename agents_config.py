@@ -71,6 +71,21 @@ original behaviour of talking to api.openai.com.
         Overrides the temperature in the examples that set one
         (chapter_02/02). Reasoning-style models reject a temperature other
         than their default, so set this to ``1`` if yours is one of them.
+
+    AGENT_STRUCTURED_OUTPUT_MODE
+        Unset leaves the SDK's own JSON Schema output alone, which is the
+        default. ``deepseek_json`` or ``minimax_function`` switch typed-output
+        agents onto that provider protocol instead, for endpoints that do not
+        accept JSON Schema ``response_format``. It is chosen explicitly for the
+        whole endpoint - it is never inferred from the model id, because
+        aliases and relays are not reliable provider identifiers. Both modes
+        work over the Chat Completions route only, so selecting one while
+        ``OPENAI_AGENTS_CHAT_API=0`` is a configuration error.
+
+    AGENT_STRUCTURED_OUTPUT_MAX_TOKENS
+        Positive integer token budget for DeepSeek JSON mode, used when the
+        example sets no ``max_tokens`` of its own. DeepSeek's JSON mode can
+        truncate or return empty content without one.
 """
 
 import base64
@@ -95,6 +110,9 @@ VISION_MODEL = os.getenv("VISION_MODEL") or None
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL") or None
 
 USING_THIRD_PARTY_ENDPOINT = OPENAI_BASE_URL is not None
+
+# The fallback protocols supported by structured_output_fallback.py.
+STRUCTURED_OUTPUT_MODES = ("deepseek_json", "minimax_function")
 
 # The local image tool reports where it put the file by returning a string the
 # model can read but cannot misinterpret; save_image() looks for this prefix.
@@ -153,6 +171,77 @@ def _flag(name: str, default: bool) -> bool:
     if value is None:
         return default
     return value.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _structured_output_mode() -> str | None:
+    """Read ``AGENT_STRUCTURED_OUTPUT_MODE``.
+
+    Unset means native SDK JSON Schema output. The mode is never inferred from
+    ``AGENT_MODEL``: the operator picks the protocol that matches the endpoint
+    configured by ``OPENAI_BASE_URL``, and model ids are not reliable
+    provider identifiers.
+    """
+    value = os.getenv("AGENT_STRUCTURED_OUTPUT_MODE")
+    if not value or not value.strip():
+        return None
+
+    mode = value.strip()
+    if mode not in STRUCTURED_OUTPUT_MODES:
+        raise ValueError(
+            f"AGENT_STRUCTURED_OUTPUT_MODE={value!r} is not supported; use "
+            f"one of {', '.join(STRUCTURED_OUTPUT_MODES)}, or leave it unset "
+            "to keep the SDK's native JSON Schema output."
+        )
+    return mode
+
+
+def _structured_output_max_tokens() -> int | None:
+    """Read ``AGENT_STRUCTURED_OUTPUT_MAX_TOKENS`` as a positive integer."""
+    value = os.getenv("AGENT_STRUCTURED_OUTPUT_MAX_TOKENS")
+    if not value or not value.strip():
+        return None
+
+    text = value.strip()
+    try:
+        max_tokens = int(text)
+    except ValueError:
+        raise ValueError(
+            f"AGENT_STRUCTURED_OUTPUT_MAX_TOKENS={value!r} is not an integer."
+        ) from None
+
+    if max_tokens <= 0:
+        raise ValueError(
+            f"AGENT_STRUCTURED_OUTPUT_MAX_TOKENS={value!r} must be a positive "
+            "integer."
+        )
+    return max_tokens
+
+
+STRUCTURED_OUTPUT_MODE = _structured_output_mode()
+
+STRUCTURED_OUTPUT_MAX_TOKENS = _structured_output_max_tokens()
+
+
+def _use_chat_completions() -> bool:
+    """Whether the SDK is routed through ``/v1/chat/completions``."""
+    return USING_THIRD_PARTY_ENDPOINT and _flag("OPENAI_AGENTS_CHAT_API", True)
+
+
+def _check_structured_output_route() -> None:
+    """Reject a fallback mode the selected route cannot serve.
+
+    Both protocols are Chat Completions requests, so running one while the SDK
+    is on ``/v1/responses`` would fail per agent run instead of once here.
+    """
+    if STRUCTURED_OUTPUT_MODE is None or _use_chat_completions():
+        return
+
+    raise ValueError(
+        f"AGENT_STRUCTURED_OUTPUT_MODE={STRUCTURED_OUTPUT_MODE} needs the Chat "
+        "Completions route: set OPENAI_BASE_URL and leave OPENAI_AGENTS_CHAT_API "
+        "at its default of 1, or unset AGENT_STRUCTURED_OUTPUT_MODE to keep the "
+        "SDK's native JSON Schema output."
+    )
 
 
 def _ensure_parent(path: str) -> None:
@@ -330,11 +419,19 @@ def _configure_agents_sdk() -> None:
     """Point the Agents SDK at the configured provider."""
     from agents import set_default_openai_api, set_tracing_disabled
 
-    if USING_THIRD_PARTY_ENDPOINT and _flag("OPENAI_AGENTS_CHAT_API", True):
+    if _use_chat_completions():
         set_default_openai_api("chat_completions")
+
+    if STRUCTURED_OUTPUT_MODE is not None:
+        import structured_output_fallback
+
+        structured_output_fallback.install(
+            STRUCTURED_OUTPUT_MODE, STRUCTURED_OUTPUT_MAX_TOKENS
+        )
 
     if _flag("OPENAI_AGENTS_DISABLE_TRACING", USING_THIRD_PARTY_ENDPOINT):
         set_tracing_disabled(True)
 
 
+_check_structured_output_route()
 _configure_agents_sdk()

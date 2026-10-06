@@ -1,4 +1,4 @@
-openai-agents  # Provides tools for building and running OpenAI-based agents
+openai-agents==0.23.1  # Provides tools for building and running OpenAI-based agents
 pydantic  # Data validation and settings management using Python type annotations
 python-dotenv  # Loads environment variables from a .env file
 autopep8  # Automatically formats Python code to conform to PEP 8
@@ -8,7 +8,7 @@ isort  # Automatically sorts Python imports
 mypy  # Static type checker for Python
 mcp[cli]
 uv # for project management and running application servers for Claude etc.
-openai-agents[viz]  # Visualization tools for OpenAI agents
+openai-agents[viz]==0.23.1  # Visualization tools for OpenAI agents
 
 plotly  # For creating interactive visualizations
 numpy  # Fundamental package for scientific computing with Python
