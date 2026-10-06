@@ -2188,7 +2188,16 @@ _DOC_PHRASES = {
     "no_streaming": "[Ss]treaming typed output is not supported",
     "syntax_only": "syntactically valid JSON",
     "not_schema_enforcement": "not schema compliance",
+    "do_not_rely": r"[Dd]o\s+not\s+rely",
+    # Acceptance is endpoint-specific and unequal across the two modes, so a
+    # reader must be told where each mode actually stopped being verified.
+    "endpoint_specific": "endpoint-specific",
 }
+
+# The one number both docs have to carry: the minimax_function two-phase path
+# is not a pass, it is a pass rate. The mode name has to sit next to it, or a
+# reader cannot tell which mode the caveat belongs to.
+_MINIMAX_TOOL_PASS_RATE = r"minimax_function.{0,300}3 of 5"
 
 
 def _documented_modes(text: str) -> set[str]:
@@ -2262,6 +2271,18 @@ class DocumentationTests(unittest.TestCase):
             "the streamed typed-output limitation",
         )
 
+    def test_env_example_documents_the_tool_bearing_limitation(self):
+        self._assert_documents(
+            self.env_example,
+            _MINIMAX_TOOL_PASS_RATE,
+            "the measured minimax_function tool-bearing pass rate",
+        )
+        self._assert_documents(
+            self.env_example,
+            _DOC_PHRASES["do_not_rely"],
+            "that the minimax_function tool-bearing path is not to be relied on",
+        )
+
     # --- README ---------------------------------------------------------
 
     def test_readme_offers_every_supported_mode(self):
@@ -2310,6 +2331,23 @@ class DocumentationTests(unittest.TestCase):
             self.readme,
             r"[Uu]nset.{0,200}json_schema",
             "that leaving the mode unset keeps the native json_schema request",
+        )
+
+    def test_readme_documents_the_tool_bearing_limitation(self):
+        # deepseek_json was accepted for both agent shapes; minimax_function
+        # only for plain typed ones. Naming the mode and the measured rate is
+        # what stops a reader from turning on the wrong one and calling the
+        # result a bug.
+        self.assertIn(_DOC_PHRASES["endpoint_specific"], self.readme)
+        self._assert_documents(
+            self.readme,
+            _MINIMAX_TOOL_PASS_RATE,
+            "the measured minimax_function tool-bearing pass rate",
+        )
+        self._assert_documents(
+            self.readme,
+            _DOC_PHRASES["do_not_rely"],
+            "that the minimax_function tool-bearing path is not to be relied on",
         )
 
 

@@ -165,6 +165,16 @@ Three limits apply to both:
   `Runner.run_streamed` is not supported in either mode, and fails before any
   request is sent rather than emitting an unvalidated stream.
 
+**Known limitation (endpoint-specific).** These results come from one endpoint,
+an LKEAP Token Plan relay, and are not provider guarantees. `deepseek_json`
+passed there for both plain and tool-bearing agents. `minimax_function` was
+verified for plain typed agents only: its tool-bearing two-phase path succeeded
+in 3 of 5 runs, and the two failures answered `finish_reason=stop` with no tool
+call for a byte-identical request. Treat that path as unreliable and do not
+rely on it — the cause was not identified and is not fixed here, and it may be
+a relay characteristic rather than a MiniMax one, so another endpoint can
+behave differently.
+
 #### Choosing `AGENT_MODEL`
 
 Providers usually serve many models, but only some can run every example. Two
