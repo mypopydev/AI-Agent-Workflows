@@ -204,6 +204,17 @@ tool, and `kimi-k2.7-code` was the only one that passed both. Note that probing
 `/v1/chat/completions` with a simple flat schema is not a reliable test — some
 models pass that and still fail the nested schemas the book actually uses.
 
+The batch model tester can also probe web search with both native Responses
+`WebSearchTool` and external Brave MCP search. Set `BATCH_TEST_WEB_SEARCH=1` to
+enable both probes. Native search is skipped when the Agents SDK is routed
+through Chat Completions; Brave search requires `BRAVE_API_KEY` and Node.js/
+`npx` (the probe pins the Brave MCP server package version). Results are
+specific to the model, provider endpoint, API route, and search integration
+being tested; a passing probe is not a universal capability
+certification. These probes are opt-in and make additional model and search API
+calls per model. Their results are reported separately and do not alter the
+base example's pass/fail status or exit code.
+
 ### 5. Run the Code
 
 To execute the sample code, navigate to the desired chapter and run the Python file. For example:
