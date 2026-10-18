@@ -34,7 +34,9 @@ def filter_available_models(catalog):
 
 
 def format_output(output):
-    output = re.sub(r"<think>.*?</think>", " ", output, flags=re.IGNORECASE | re.DOTALL)
+    output = re.sub(
+        r"<think>.*?</think>", " ", output, flags=re.IGNORECASE | re.DOTALL
+    )
     output = re.sub(
         r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x1b\x07\x9c]*(?:\x07|\x1b\\|\x9c))",
         " ",
@@ -45,7 +47,11 @@ def format_output(output):
         for char in output
         if unicodedata.category(char) != "Cc" or char in "\r\n\t"
     )
-    lines = (" ".join(line.split()) for line in output.splitlines() if line.strip())
+    lines = (
+        " ".join(line.split())
+        for line in output.splitlines()
+        if line.strip()
+    )
     return "\n".join(lines)
 
 
@@ -70,7 +76,10 @@ def run_model(model_id, api_key=None):
     detail = (result.stderr or result.stdout).strip()
     if api_key:
         detail = detail.replace(api_key, "[REDACTED]")
-    return "FAIL", detail.splitlines()[-1] if detail else "Process exited unsuccessfully"
+    return (
+        "FAIL",
+        detail.splitlines()[-1] if detail else "Process exited unsuccessfully",
+    )
 
 
 def identify_model_name(model_id, api_key=None):
@@ -78,7 +87,11 @@ def identify_model_name(model_id, api_key=None):
     env["AGENT_MODEL"] = model_id
     try:
         result = subprocess.run(
-            [sys.executable, str(Path(__file__).resolve()), "--report-model-name"],
+            [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                "--report-model-name",
+            ],
             cwd=ROOT,
             env=env,
             capture_output=True,
@@ -113,8 +126,9 @@ def report_model_name(model_id):
         name="Model Name Reporter",
         model=agents_config.model(model_id),
         instructions=(
-            "Answer based only on what you can confirm about the model serving this "
-            "request. Do not infer or guess. If you cannot confirm, say so."
+            "Answer based only on what you can confirm about the model "
+            "serving this request. Do not infer or guess. If you cannot "
+            "confirm, say so."
         ),
     )
     run_config = RunConfig(
@@ -131,8 +145,9 @@ def report_model_name(model_id):
     id_check = Runner.run_sync(
         agent,
         input=(
-            f"The configured model ID is {model_id}. Does it exactly match the "
-            "model serving this request? Reply Yes, No, or Unable to confirm."
+            f"The configured model ID is {model_id}. Does it exactly "
+            "match the model serving this request? Reply Yes, No, or "
+            "Unable to confirm."
         ),
         run_config=run_config,
     )
@@ -143,7 +158,10 @@ def report_model_name(model_id):
 def fetch_models(base_url, api_key):
     request = Request(
         f"{base_url.rstrip('/')}/models",
-        headers={"Authorization": f"Bearer {api_key}", "Accept": "application/json"},
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Accept": "application/json",
+        },
     )
     with urlopen(request, timeout=30) as response:
         return filter_available_models(json.load(response))
@@ -154,7 +172,9 @@ def main():
     base_url = os.getenv("OPENAI_BASE_URL")
     api_key = os.getenv("OPENAI_API_KEY")
     if not base_url or not api_key:
-        raise SystemExit("OPENAI_BASE_URL and OPENAI_API_KEY must be set in .env")
+        raise SystemExit(
+            "OPENAI_BASE_URL and OPENAI_API_KEY must be set in .env"
+        )
 
     models = fetch_models(base_url, api_key)
     if not models:

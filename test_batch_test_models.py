@@ -50,7 +50,9 @@ class FilterAvailableModelsTests(unittest.TestCase):
 
         self.assertEqual(config["BATCH_TEST_EXCLUDED_MODELS"], expected)
 
-    def test_format_output_preserves_numbered_lines_and_removes_multiline_think_blocks(self):
+    def test_format_output_preserves_numbered_lines_and_removes_think_blocks(
+        self,
+    ):
         output = """Plan begins
 <think>internal reasoning
 spans multiple lines</think>
@@ -103,7 +105,10 @@ spans multiple lines</think>
 
         self.assertEqual(result, ("REPORTED", output))
 
-    @patch("batch_test_models.subprocess.run", side_effect=OSError("launch failed"))
+    @patch(
+        "batch_test_models.subprocess.run",
+        side_effect=OSError("launch failed"),
+    )
     def test_model_name_probe_records_launch_failure(self, subprocess_run):
         self.assertEqual(
             identify_model_name("model-x"), ("FAIL", "launch failed")
@@ -165,7 +170,9 @@ spans multiple lines</think>
             "model_id",
         )
         self.assertEqual(
-            agent_module.Runner.run_sync.call_args.kwargs["run_config"].model_provider,
+            agent_module.Runner.run_sync.call_args.kwargs[
+                "run_config"
+            ].model_provider,
             agent_module.MultiProvider.return_value,
         )
 
@@ -200,7 +207,8 @@ spans multiple lines</think>
 
         identify_model_name.assert_called_once_with("model-x", "secret")
         self.assertIn(
-            "self-reported name (REPORTED, unverified): Model X", output.getvalue()
+            "self-reported name (REPORTED, unverified): Model X",
+            output.getvalue(),
         )
         self.assertEqual(result, 0)
 
@@ -226,10 +234,15 @@ spans multiple lines</think>
 
         self.assertEqual(result, 0)
         self.assertIn("PASS model-x — example output", output.getvalue())
-        self.assertIn("self-reported name (TIMEOUT, unverified)", output.getvalue())
+        self.assertIn(
+            "self-reported name (TIMEOUT, unverified)", output.getvalue()
+        )
 
     @patch("batch_test_models.identify_model_name")
-    @patch("batch_test_models.run_model", return_value=("PASS", "example output"))
+    @patch(
+        "batch_test_models.run_model",
+        return_value=("PASS", "example output"),
+    )
     @patch("batch_test_models.fetch_models", return_value=["model-x"])
     @patch("batch_test_models.load_dotenv")
     def test_model_name_probe_is_disabled_by_default(
