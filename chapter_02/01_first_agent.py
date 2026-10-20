@@ -7,8 +7,8 @@ _sys.path.insert(0, str(_root))
 
 import agents_config  # noqa: E402,F401
 
-from agents import Agent, Runner
-from dotenv import load_dotenv
+from agents import Agent, Runner  # noqa: E402
+from dotenv import load_dotenv  # noqa: E402
 
 # Load environment variables from .env file
 load_dotenv()

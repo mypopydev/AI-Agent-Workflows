@@ -5,15 +5,15 @@ _root = next(p for p in _pathlib.Path(__file__).resolve().parents
              if (p / "agents_config.py").is_file())
 _sys.path.insert(0, str(_root))
 
+from dotenv import load_dotenv  # noqa: E402
+
+load_dotenv(_root / ".env")
+
 import agents_config  # noqa: E402,F401
 
-from agents import Agent, Runner, function_tool, trace
-from dotenv import load_dotenv
-from pydantic import BaseModel, ConfigDict
-from typing_extensions import TypedDict
-
-# Load environment variables from .env file
-load_dotenv()
+from agents import Agent, Runner, function_tool, trace  # noqa: E402
+from pydantic import BaseModel, ConfigDict  # noqa: E402
+from typing_extensions import TypedDict  # noqa: E402
 
 # Agent Instructions
 instructions = """
@@ -21,15 +21,16 @@ You are a research planning assistant.
 
 **TASK INSTRUCTIONS**
 - You will be given a research topic.
-- Begin by using the tool get_research_sources() 
-to get a list of available research sources. 
+- Begin by using the tool get_research_sources()
+to get a list of available research sources.
 - Use the tool get_resource_url() to look up the url for the research source.
-- Constrain your research plan 
+- Constrain your research plan
 only to use the available research sources.
 - Your task is to provide a plan for researching this topic.
-- Output 5 concise tasks and specify which of the 
+- Output 5 concise tasks and specify which of the
 available research sources will be used for each task.
 """
+
 
 class ResearchSource(TypedDict):
     name: str
@@ -46,11 +47,12 @@ class Task(TypedDict):
     description: str
     """Task description."""
 
+
 class ResearchPlanModel(BaseModel):
     tasks: list[Task]
     """Numbered tasks for research."""
     model_config = ConfigDict(extra='forbid')
-    
+
 
 @function_tool
 def get_research_sources() -> list[str]:
@@ -60,7 +62,8 @@ def get_research_sources() -> list[str]:
         "Google",
         "YouTube",
     ]
-    return search_sources   
+    return search_sources
+
 
 @function_tool
 def get_resource_url(research_soruce: str) -> str:
@@ -70,21 +73,22 @@ def get_resource_url(research_soruce: str) -> str:
         "Google": "https://www.google.com",
         "YouTube": "https://www.youtube.com",
     }
-    return search_sources[research_soruce] 
-    
+    return search_sources[research_soruce]
+
+
 agent = Agent(
-    name="Research Planner", 
+    name="Research Planner",
     instructions=instructions,
     output_type=ResearchPlanModel,
-    tools=[get_research_sources, get_resource_url],  
-    )
+    tools=[get_research_sources, get_resource_url],
+)
 
 input = "learn about AI agents"
 
 with trace("Deep Research Workflow (Tools)"):
     result = Runner.run_sync(
-        agent, 
+        agent,
         input=input,
-        )
+    )
 
 print(result.final_output)

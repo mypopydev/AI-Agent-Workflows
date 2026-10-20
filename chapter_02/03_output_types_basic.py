@@ -7,11 +7,11 @@ _sys.path.insert(0, str(_root))
 
 import agents_config  # noqa: E402,F401
 
-from typing import List
+from typing import List  # noqa: E402
 
-from agents import Agent, Runner
-from dotenv import load_dotenv
-from pydantic import BaseModel
+from agents import Agent, Runner  # noqa: E402
+from dotenv import load_dotenv  # noqa: E402
+from pydantic import BaseModel  # noqa: E402
 
 # Load environment variables from .env file
 load_dotenv()
@@ -26,13 +26,14 @@ You are a research planning assistant.
 - Output 5 concise tasks (5 words or less) to your plan.
 """
 
+
 class ResearchPlanModel(BaseModel):
     tasks: List[str]
     """A list of tasks to perform for research."""
 
-    
+
 agent = Agent(
-    name="Research Planner", 
+    name="Research Planner",
     instructions=instructions,
     output_type=ResearchPlanModel,
     )
@@ -40,7 +41,7 @@ agent = Agent(
 input = "learn about AI agents"
 
 result = Runner.run_sync(
-    agent, 
+    agent,
     input=input,
     )
 

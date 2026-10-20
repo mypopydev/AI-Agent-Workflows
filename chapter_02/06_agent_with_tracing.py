@@ -7,10 +7,10 @@ _sys.path.insert(0, str(_root))
 
 import agents_config  # noqa: E402,F401
 
-from agents import Agent, Runner, trace
-from dotenv import load_dotenv
-from pydantic import BaseModel, ConfigDict
-from typing_extensions import TypedDict
+from agents import Agent, Runner, trace  # noqa: E402
+from dotenv import load_dotenv  # noqa: E402
+from pydantic import BaseModel, ConfigDict  # noqa: E402
+from typing_extensions import TypedDict  # noqa: E402
 
 # Load environment variables from .env file
 load_dotenv()
@@ -25,9 +25,11 @@ You are a research planning assistant.
 - Output 5 concise tasks (5 words or less) to your plan.
 """
 
+
 class Task(TypedDict):
     id: int
     description: str
+
 
 class ResearchPlanModel(BaseModel):
     tasks: list[Task]
@@ -35,9 +37,9 @@ class ResearchPlanModel(BaseModel):
 
     model_config = ConfigDict(extra='forbid')
 
-    
+
 agent = Agent(
-    name="Research Planner", 
+    name="Research Planner",
     instructions=instructions,
     output_type=ResearchPlanModel,
     )
@@ -46,7 +48,7 @@ input = "learn about AI agents"
 
 with trace("Deep Research Workflow"):
     result = Runner.run_sync(
-        agent, 
+        agent,
         input=input,
         )
 

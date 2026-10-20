@@ -6,15 +6,15 @@ _root = next(p for p in _pathlib.Path(__file__).resolve().parents
              if (p / "agents_config.py").is_file())
 _sys.path.insert(0, str(_root))
 
-from dotenv import load_dotenv
+from dotenv import load_dotenv  # noqa: E402
 
 load_dotenv(_root / ".env")
 
 import agents_config  # noqa: E402,F401
 
-from agents import Agent, Runner, function_tool
-from pydantic import BaseModel, ConfigDict
-from typing_extensions import TypedDict
+from agents import Agent, Runner, function_tool  # noqa: E402
+from pydantic import BaseModel, ConfigDict  # noqa: E402
+from typing_extensions import TypedDict  # noqa: E402
 
 # Agent Instructions
 instructions = """
@@ -22,14 +22,15 @@ You are a research planning assistant.
 
 **TASK INSTRUCTIONS**
 - You will be given a research topic.
-- Begin by using the tool get_research_sources() 
-to get a list of available research sources. 
-- Constrain your research plan 
+- Begin by using the tool get_research_sources()
+to get a list of available research sources.
+- Constrain your research plan
 only to use the available research sources.
 - Your task is to provide a plan for researching this topic.
-- Output 5 concise tasks and specify which of the 
+- Output 5 concise tasks and specify which of the
 available research sources will be used for each task.
 """
+
 
 class Task(TypedDict):
     step: int
@@ -39,11 +40,12 @@ class Task(TypedDict):
     description: str
     """Task description."""
 
+
 class ResearchPlanModel(BaseModel):
     tasks: list[Task]
     """Numbered tasks for research."""
     model_config = ConfigDict(extra='forbid')
-    
+
 
 @function_tool
 def get_research_sources() -> list[str]:
@@ -53,10 +55,11 @@ def get_research_sources() -> list[str]:
         "Google",
         "YouTube",
     ]
-    return search_sources    
-    
+    return search_sources
+
+
 agent = Agent(
-    name="Research Planner", 
+    name="Research Planner",
     instructions=instructions,
     output_type=ResearchPlanModel,
     tools=[get_research_sources],  # Register the tool with the agent
@@ -65,14 +68,21 @@ agent = Agent(
 
 def print_run_usage(result):
     usage = result.context_wrapper.usage
-    configured_model = os.getenv("AGENT_MODEL") or os.getenv("OPENAI_DEFAULT_MODEL")
+    configured_model = (
+        os.getenv("AGENT_MODEL") or os.getenv("OPENAI_DEFAULT_MODEL")
+    )
 
     print("\nRun details:")
     if configured_model:
         print(f"Model (configured): {configured_model}")
     else:
-        print("Model (configured): Agents SDK default (not explicitly configured)")
-    print("The actual provider-served model may differ from this configuration.")
+        print(
+            "Model (configured): Agents SDK default "
+            "(not explicitly configured)"
+        )
+    print(
+        "The actual provider-served model may differ from this configuration."
+    )
     print(f"Requests: {usage.requests}")
     print(f"Input tokens: {usage.input_tokens}")
     print(f"Output tokens: {usage.output_tokens}")
@@ -100,18 +110,18 @@ def print_run_usage(result):
                 f"Request {index}: input={request.input_tokens}, "
                 f"output={request.output_tokens}, total={request.total_tokens}"
             )
-            print(
-                "  Cached input tokens: "
-                f"{token_detail(request.input_tokens_details, 'cached_tokens')}"
+            cached_tokens = token_detail(
+                request.input_tokens_details, "cached_tokens"
             )
-            print(
-                "  Cache write input tokens: "
-                f"{token_detail(request.input_tokens_details, 'cache_write_tokens')}"
+            cache_write_tokens = token_detail(
+                request.input_tokens_details, "cache_write_tokens"
             )
-            print(
-                "  Reasoning output tokens: "
-                f"{token_detail(request.output_tokens_details, 'reasoning_tokens')}"
+            reasoning_tokens = token_detail(
+                request.output_tokens_details, "reasoning_tokens"
             )
+            print(f"  Cached input tokens: {cached_tokens}")
+            print(f"  Cache write input tokens: {cache_write_tokens}")
+            print(f"  Reasoning output tokens: {reasoning_tokens}")
     else:
         print("Per-request token details: not available")
     print("Note: the SDK may normalize omitted provider detail fields to 0.")
@@ -120,7 +130,7 @@ def print_run_usage(result):
 input = "learn about AI agents"
 
 result = Runner.run_sync(
-    agent, 
+    agent,
     input=input,
     )
 
