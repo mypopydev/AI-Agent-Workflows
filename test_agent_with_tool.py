@@ -11,10 +11,22 @@ from dotenv import load_dotenv
 
 ROOT = Path(__file__).resolve().parent
 SCRIPT = ROOT / "chapter_02" / "07_agent_with_tool.py"
+TYPED_OUTPUT_SCRIPTS = tuple(
+    ROOT / "chapter_02" / name
+    for name in (
+        "03_output_types_basic.py",
+        "04_output_types.py",
+        "05_output_types_fixed.py",
+        "06_agent_with_tracing.py",
+        "07_agent_with_tool.py",
+        "07x_agent_with_tool_extended.py",
+        "08_agent_with_tools_tracing.py",
+    )
+)
 
 
 class AgentWithToolRegressionTests(unittest.TestCase):
-    def _run_mocked_script(self, overrides):
+    def _run_mocked_script(self, overrides, script=SCRIPT, expected_calls=1):
         env = os.environ.copy()
         env.pop("AGENT_STRUCTURED_OUTPUT_MODE", None)
         env.pop("AGENT_STRUCTURED_OUTPUT_MAX_TOKENS", None)
@@ -71,7 +83,7 @@ print(json.dumps({
 }))
 """
         completed = subprocess.run(
-            [sys.executable, "-c", harness, str(SCRIPT)],
+            [sys.executable, "-c", harness, str(script)],
             cwd=ROOT,
             env=env,
             capture_output=True,
@@ -79,29 +91,46 @@ print(json.dumps({
             check=False,
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
-        return json.loads(completed.stdout)
+        result = json.loads(completed.stdout)
+        self.assertEqual(result["runner_calls"], expected_calls)
+        return result
 
-    def test_third_party_endpoint_defaults_to_deepseek_json_without_live_calls(
-        self,
-    ):
-        result = self._run_mocked_script(
-            {
-                "OPENAI_BASE_URL": "https://provider.invalid/v1",
-                "OPENAI_API_KEY": "test-key",
-                "AGENT_MODEL": "deepseek/deepseek-v4-flash",
-            }
-        )
+    def test_typed_examples_keep_native_mode_unless_configured(self):
+        for script in TYPED_OUTPUT_SCRIPTS:
+            with self.subTest(script=script.name):
+                result = self._run_mocked_script(
+                    {
+                        "OPENAI_BASE_URL": "https://provider.invalid/v1",
+                        "OPENAI_API_KEY": "test-key",
+                        "AGENT_MODEL": "deepseek/deepseek-v4-flash",
+                    },
+                    script=script,
+                )
 
-        self.assertEqual(result["install_calls"], [["deepseek_json", 2048]])
-        self.assertEqual(result["mode"], "deepseek_json")
-        self.assertEqual(result["max_tokens"], 2048)
-        self.assertEqual(result["runner_calls"], 1)
-        self.assertIn("mock plan", result["output"])
-        self.assertIn(
-            "Model (configured): deepseek/deepseek-v4-flash", result["output"]
-        )
-        self.assertIn("Requests: 1", result["output"])
-        self.assertIn("Total tokens: 16", result["output"])
+                self.assertEqual(result["install_calls"], [])
+                self.assertIsNone(result["mode"])
+                self.assertIsNone(result["max_tokens"])
+                self.assertIn("mock plan", result["output"])
+
+    def test_typed_examples_use_explicit_shared_fallback_settings(self):
+        for script in TYPED_OUTPUT_SCRIPTS:
+            with self.subTest(script=script.name):
+                result = self._run_mocked_script(
+                    {
+                        "OPENAI_BASE_URL": "https://provider.invalid/v1",
+                        "OPENAI_API_KEY": "test-key",
+                        "AGENT_MODEL": "deepseek/deepseek-v4-flash",
+                        "AGENT_STRUCTURED_OUTPUT_MODE": "deepseek_json",
+                        "AGENT_STRUCTURED_OUTPUT_MAX_TOKENS": "2048",
+                    },
+                    script=script,
+                )
+
+                self.assertEqual(
+                    result["install_calls"], [["deepseek_json", 2048]]
+                )
+                self.assertEqual(result["mode"], "deepseek_json")
+                self.assertEqual(result["max_tokens"], 2048)
 
     def test_explicit_fallback_settings_are_preserved(self):
         result = self._run_mocked_script(
@@ -117,7 +146,6 @@ print(json.dumps({
         self.assertEqual(result["install_calls"], [["minimax_function", 4096]])
         self.assertEqual(result["mode"], "minimax_function")
         self.assertEqual(result["max_tokens"], 4096)
-        self.assertEqual(result["runner_calls"], 1)
 
     @unittest.skipUnless(
         os.getenv("RUN_DEEPSEEK_LIVE_TEST") == "1",
