@@ -10,15 +10,6 @@ from dotenv import load_dotenv
 
 load_dotenv(_root / ".env")
 
-if os.getenv("OPENAI_BASE_URL") and not os.getenv("AGENT_STRUCTURED_OUTPUT_MODE", "").strip():
-    os.environ["AGENT_STRUCTURED_OUTPUT_MODE"] = "deepseek_json"
-
-if (
-    os.getenv("AGENT_STRUCTURED_OUTPUT_MODE", "").strip() == "deepseek_json"
-    and not os.getenv("AGENT_STRUCTURED_OUTPUT_MAX_TOKENS", "").strip()
-):
-    os.environ["AGENT_STRUCTURED_OUTPUT_MAX_TOKENS"] = "2048"
-
 import agents_config  # noqa: E402,F401
 
 from agents import Agent, Runner, function_tool
