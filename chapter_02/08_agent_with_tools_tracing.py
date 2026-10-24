@@ -1,3 +1,4 @@
+import json
 import pathlib as _pathlib
 import sys as _sys
 
@@ -91,4 +92,18 @@ with trace("Deep Research Workflow (Tools)"):
         input=input,
     )
 
-print(result.final_output.model_dump_json(indent=2))
+usage = result.context_wrapper.usage
+print(
+    json.dumps(
+        {
+            "result": result.final_output.model_dump(),
+            "usage": {
+                "requests": usage.requests,
+                "input_tokens": usage.input_tokens,
+                "output_tokens": usage.output_tokens,
+                "total_tokens": usage.total_tokens,
+            },
+        },
+        indent=2,
+    )
+)

@@ -64,8 +64,8 @@ usage = SimpleNamespace(
     request_usage_entries=[],
 )
 class MockFinalOutput(str):
-    def model_dump_json(self, indent=None):
-        return json.dumps({"result": str(self)}, indent=indent)
+    def model_dump(self):
+        return {"result": str(self)}
 
 Runner.run_sync = lambda *args, **kwargs: (
     runner_calls.append(args),
@@ -104,9 +104,21 @@ print(json.dumps({
             {}, script=TYPED_OUTPUT_SCRIPTS[-1]
         )
 
-        self.assertTrue(result["output"].lstrip().startswith("{"))
-        self.assertEqual(json.loads(result["output"]), {"result": "mock plan"})
+        output = json.loads(result["output"])
+        self.assertEqual(
+            output,
+            {
+                "result": {"result": "mock plan"},
+                "usage": {
+                    "requests": 1,
+                    "input_tokens": 12,
+                    "output_tokens": 4,
+                    "total_tokens": 16,
+                },
+            },
+        )
         self.assertIn('\n  "result":', result["output"])
+        self.assertIn('\n  "usage":', result["output"])
 
     def test_typed_examples_keep_native_mode_unless_configured(self):
         for script in TYPED_OUTPUT_SCRIPTS:
