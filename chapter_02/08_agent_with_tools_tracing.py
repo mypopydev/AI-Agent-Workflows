@@ -91,4 +91,4 @@ with trace("Deep Research Workflow (Tools)"):
         input=input,
     )
 
-print(result.final_output)
+print(result.final_output.model_dump_json(indent=2))

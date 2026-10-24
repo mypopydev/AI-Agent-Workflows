@@ -63,10 +63,14 @@ usage = SimpleNamespace(
     output_tokens_details=SimpleNamespace(reasoning_tokens=0),
     request_usage_entries=[],
 )
+class MockFinalOutput(str):
+    def model_dump_json(self, indent=None):
+        return json.dumps({"result": str(self)}, indent=indent)
+
 Runner.run_sync = lambda *args, **kwargs: (
     runner_calls.append(args),
     SimpleNamespace(
-        final_output="mock plan",
+        final_output=MockFinalOutput("mock plan"),
         context_wrapper=SimpleNamespace(usage=usage),
     ),
 )[1]
@@ -94,6 +98,15 @@ print(json.dumps({
         result = json.loads(completed.stdout)
         self.assertEqual(result["runner_calls"], expected_calls)
         return result
+
+    def test_tracing_example_prints_formatted_json(self):
+        result = self._run_mocked_script(
+            {}, script=TYPED_OUTPUT_SCRIPTS[-1]
+        )
+
+        self.assertTrue(result["output"].lstrip().startswith("{"))
+        self.assertEqual(json.loads(result["output"]), {"result": "mock plan"})
+        self.assertIn('\n  "result":', result["output"])
 
     def test_typed_examples_keep_native_mode_unless_configured(self):
         for script in TYPED_OUTPUT_SCRIPTS:
