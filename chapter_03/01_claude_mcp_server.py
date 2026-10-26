@@ -1,10 +1,10 @@
-from mcp.server.fastmcp import FastMCP
+from mcp.server import MCPServer
 
 # Create an MCP server
-mcp = FastMCP("Research Tools")  
+mcp = MCPServer("Research Tools")
 
 
-@mcp.tool()  
+@mcp.tool()
 def get_research_sources() -> list[str]:
     """Provides a list of research sources."""
     search_sources = [
